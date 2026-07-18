@@ -1,0 +1,130 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    ESP32 + BH1750 (Gy-302) CONNECTION                        ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+┌──────────────────────────────┐          ┌──────────────────────────────┐
+│                              │          │                              │
+│         ESP32 BOARD          │  WIRING  │     BH1750 (Gy-302) MODULE   │
+│                              │          │                              │
+│  ┌─────────────────────┐     │          │  ┌──────────────────────┐    │
+│  │                     │     │          │  │                      │    │
+│  │  3.3V    [●] ●     │────┼───────────┼──►│ VCC                │    │
+│  │  GND     [●] ●     │     │          │  │                      │    │
+│  │  GPIO 21 [●] ● SDA │────┼───────────┼──►│ SDA                │    │
+│  │  GPIO 22 [●] ● SCL │────┼───────────┼──►│ SCL                │    │
+│  │                     │     │          │  │                      │    │
+│  └─────────────────────┘     │          │  └──────────────────────┘    │
+│                              │          │                              │
+└──────────────────────────────┘          └──────────────────────────────┘
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                            PIN CONNECTION TABLE                               ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+  ESP32 Pin          Gy-302 Module      Function         Notes
+─────────────    ───────────────────   ────────────   ───────────────────────
+    3.3V     ───►     VCC           Power Supply        IMPORTANT: Use 3.3V!
+     GND     ───►     GND           Ground              Common ground
+   GPIO 21   ───►     SDA           I2C Data Line       Serial Data
+   GPIO 22   ───►     SCL           I2C Clock Line      Serial Clock
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                        PLATFORMIO CONFIGURATION                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+Add this to your platformio.ini:
+
+  [env:esp32dev]
+  platform = espressif32
+  board = esp32dev
+  framework = arduino
+  upload_speed = 921600
+  monitor_speed = 115200
+  
+  ; Add BH1750 library dependency:
+  lib_deps = 
+      clamberson/BH1750@^1.0.0
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                            I2C ADDRESS CONFIGURATION                          ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+  A0 Pin Connection    I2C Address    Description
+───────────────────  ─────────────  ──────────────────────────────
+     Unconnected           0x23      Default address (most common)
+        GND                0x23      Alternative connection
+        VCC               0x5C       Use if A0 connected to 3.3V
+
+Note: Our code uses the default address (0x23). If you connect A0 to VCC,
+modify the code to use: BH1750 lightSensor(0x5C);
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                         TYPICAL LIGHT LEVELS                                  ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+   Lux Range        Light Condition           Example
+───────────────  ───────────────────       ─────────────────────
+     0.1-1         Full moon night          Very dark, almost no light
+      1-10         Emergency lighting       Dark room with minimal light
+     10-100        Residential lighting     Living room, bedroom lighting
+    100-500        Office lighting          Computer work areas
+   1000-5000       Bright daylight          Near windows, shaded outdoors
+  10000-50000      Direct sunlight          Clear summer noon
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                              TROUBLESHOOTING                                 ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+SENSOR NOT DETECTED:
+  ✓ Check all connections are secure
+  ✓ Verify VCC is connected to 3.3V (NOT 5V!)
+  ✓ Ensure SDA is connected to GPIO 21
+  ✓ Verify SCL is connected to GPIO 22
+  ✓ Try shorter jumper wires
+  ✓ Add external pull-up resistors (4.7kΩ)
+
+INCONSISTENT READINGS:
+  ✓ Check stable power supply
+  ✓ Keep I2C wires short (<10cm)
+  ✓ Avoid electrical interference
+  ✓ Test with different light sources
+
+SERIAL MONITOR ISSUES:
+  ✓ Set baud rate to 115200
+  ✓ Verify USB connection
+  ✓ Try different USB cable
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                              QUICK START CHECKLIST                           ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+  [ ] 1. Connect VCC to ESP32 3.3V pin
+  [ ] 2. Connect GND to ESP32 GND pin
+  [ ] 3. Connect SDA to ESP32 GPIO 21
+  [ ] 4. Connect SCL to ESP32 GPIO 22
+  [ ] 5. Add BH1750 library to platformio.ini
+  [ ] 6. Upload code to ESP32
+  [ ] 7. Open serial monitor at 115200 baud
+  [ ] 8. Test by covering/uncovering sensor
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                              IMPORTANT SAFETY NOTES                          ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+  ⚠️  DO NOT connect VCC to 5V - BH1750 is a 3.3V device only!
+  ⚠️  Always double-check connections before powering up
+  ⚠️  Handle the sensor gently - it's delicate
+  ⚠️  Work in static-free environment when handling electronics
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                         NEED MORE HELP?                                       ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+  • Check EXPERIMENT_GUIDE.md for comprehensive documentation
+  • Review BH1750_Guide.md for detailed setup instructions
+  • See QUICK_REFERENCE.md for quick reference card
+  • Consult the library documentation online
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                        Happy Experimenting! 🌟                                 ║
+╚══════════════════════════════════════════════════════════════════════════════╝
