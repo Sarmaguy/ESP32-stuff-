@@ -177,6 +177,7 @@ void setup() {
   initNetworking();
 
   ArduinoOTA.setHostname("esp32-slave");
+  ArduinoOTA.setPassword(otaPassword);
   ArduinoOTA.onStart([]() { Serial.println("OTA: start"); });
   ArduinoOTA.onEnd([]() { Serial.println("OTA: done"); });
   ArduinoOTA.onError([](ota_error_t e) {

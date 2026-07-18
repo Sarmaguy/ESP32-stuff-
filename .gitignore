@@ -15,6 +15,9 @@
 # WiFi credentials (copy secrets.h.example to secrets.h and fill in)
 include/secrets.h
 
+# OTA upload config with password (copy platformio_local.ini.example and fill in)
+platformio_local.ini
+
 # OS files
 .DS_Store
 Thumbs.db
