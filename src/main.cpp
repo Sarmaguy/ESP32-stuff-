@@ -446,7 +446,7 @@ const char MAIN_page[] PROGMEM = R"=====(
 <title>ESP32 LED Controller</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;min-height:100vh;display:flex;justify-content:center;align-items:center;padding:20px}
+body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;min-height:100vh;display:flex;justify-content:center;align-items:center;padding:20px;touch-action:manipulation}
 .container{max-width:420px;width:100%;background:#16213e;border-radius:16px;padding:24px;box-shadow:0 8px 32px rgba(0,0,0,0.3)}
 h1{text-align:center;color:#0f3460;margin-bottom:20px;font-size:1.4em}
 .preview{width:100%;height:36px;border-radius:10px;margin-bottom:16px;transition:background .3s;background:#1a1a2e}
@@ -468,15 +468,21 @@ h1{text-align:center;color:#0f3460;margin-bottom:20px;font-size:1.4em}
 .aq-moderate{color:#f1c40f}
 .aq-poor{color:#e67e22}
 .aq-hazardous{color:#e74c3c}
-.ctrl{margin-bottom:14px}
-.ctrl label{display:block;margin-bottom:6px;color:#aaa;font-size:0.85em}
-.row{display:flex;align-items:center;gap:12px}
-.row input[type=color]{width:54px;height:54px;border:none;border-radius:10px;cursor:pointer;background:0 0;padding:0}
-.row input[type=range]{flex:1;height:6px;-webkit-appearance:none;appearance:none;background:#0f3460;border-radius:3px;outline:0}
-.row input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:22px;height:22px;border-radius:50%;background:#e94560;cursor:pointer}
+.ctrl{margin-bottom:16px}
+.ctrl label{display:block;margin-bottom:8px;color:#aaa;font-size:0.85em}
+.swatches{display:grid;grid-template-columns:repeat(7,1fr);gap:8px;margin-bottom:14px}
+.swatches button{aspect-ratio:1;width:100%;border:2px solid rgba(255,255,255,0.15);border-radius:50%;cursor:pointer;padding:0;transition:.15s}
+.swatches button.sel{border-color:#fff;transform:scale(1.12);box-shadow:0 0 8px rgba(255,255,255,0.4)}
+.slide-row{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+.slide-row:last-child{margin-bottom:0}
+input[type=range]{flex:1;height:16px;-webkit-appearance:none;appearance:none;background:#0f3460;border-radius:8px;outline:0}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:30px;height:30px;border-radius:50%;background:#fff;border:3px solid #e94560;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,0.5)}
+input[type=range]::-moz-range-thumb{width:24px;height:24px;border-radius:50%;background:#fff;border:3px solid #e94560;cursor:pointer}
+#hueSlider{background:linear-gradient(to right,#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00)}
+.sl-lab{min-width:34px;color:#888;font-size:0.75em}
 .bright-val{min-width:36px;text-align:center;font-weight:700;color:#e94560}
 .tout-row{display:flex;align-items:center;gap:8px}
-.tout-row input[type=number]{width:80px;padding:8px;border:none;border-radius:8px;background:#1a1a2e;color:#eee;font-size:1em;text-align:center}
+.tout-row input[type=number]{width:90px;padding:10px;border:none;border-radius:8px;background:#1a1a2e;color:#eee;font-size:16px;text-align:center}
 .tout-row span{color:#aaa}
 </style>
 </head>
@@ -509,11 +515,13 @@ h1{text-align:center;color:#0f3460;margin-bottom:20px;font-size:1.4em}
 </div>
 <div class="ctrl">
 <label>Color</label>
-<div class="row">
-<input type="color" id="colorPick" value="#ffffff" oninput="setColor(this.value)">
-<input type="range" id="brightSlider" min="1" max="255" value="128" oninput="setBright(+this.value)">
-<span class="bright-val" id="bVal">128</span>
+<div class="swatches" id="swatches"></div>
+<div class="slide-row"><span class="sl-lab">Hue</span><input type="range" id="hueSlider" min="0" max="360" value="0" oninput="onHS()"></div>
+<div class="slide-row"><span class="sl-lab">Vivid</span><input type="range" id="satSlider" min="0" max="100" value="0" oninput="onHS()"></div>
 </div>
+<div class="ctrl">
+<label>Brightness</label>
+<div class="slide-row"><input type="range" id="brightSlider" min="1" max="255" value="128" oninput="setBright(+this.value)"><span class="bright-val" id="bVal">128</span></div>
 </div>
 <div class="ctrl">
 <label>Motion timeout (seconds)</label>
@@ -531,10 +539,20 @@ h1{text-align:center;color:#0f3460;margin-bottom:20px;font-size:1.4em}
 </div>
 </div>
 <script>
-let toutTimer;
+let toutTimer,colTimer;
+
+const SW=['#FFB46B','#FFFFFF','#FF0000','#FF6A00','#FFC800','#80FF00','#00FF00','#00FFB0','#00FFFF','#0080FF','#0000FF','#8000FF','#FF00FF','#FF0060'];
+const swDiv=document.getElementById('swatches');
+SW.forEach(c=>{const b=document.createElement('button');b.style.background=c;b.dataset.c=c;b.onclick=()=>{const[h,s]=hex2hs(c);setHS(h,s);sendColor(c)};swDiv.appendChild(b)});
+
+function hs2hex(h,s){s/=100;const f=n=>{const k=(n+h/60)%6;const v=1-s*Math.max(0,Math.min(k,4-k,1));return Math.round(v*255).toString(16).padStart(2,'0')};return('#'+f(5)+f(3)+f(1)).toUpperCase()}
+function hex2hs(x){const r=parseInt(x.substr(1,2),16)/255,g=parseInt(x.substr(3,2),16)/255,b=parseInt(x.substr(5,2),16)/255;const mx=Math.max(r,g,b),mn=Math.min(r,g,b),d=mx-mn;let h=0;if(d){if(mx===r)h=((g-b)/d)%6;else if(mx===g)h=(b-r)/d+2;else h=(r-g)/d+4;h*=60;if(h<0)h+=360}return[Math.round(h),mx?Math.round(d/mx*100):0]}
+function setHS(h,s){document.getElementById('hueSlider').value=h;document.getElementById('satSlider').value=s;paintHS(h,s)}
+function paintHS(h,s){const full=hs2hex(h,100),cur=hs2hex(h,s);document.getElementById('satSlider').style.background='linear-gradient(to right,#fff,'+full+')';document.getElementById('preview').style.background=cur;document.querySelectorAll('.swatches button').forEach(b=>b.classList.toggle('sel',b.dataset.c===cur))}
+function onHS(){const h=+document.getElementById('hueSlider').value,s=+document.getElementById('satSlider').value;paintHS(h,s);clearTimeout(colTimer);colTimer=setTimeout(()=>sendColor(hs2hex(h,s)),120)}
+function sendColor(c){fetch('/api/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({color:c})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
 
 function setMode(m){fetch('/api/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
-function setColor(c){fetch('/api/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({color:c})}).then(r=>r.json()).then(d=>{if(d.success){document.getElementById('preview').style.background=c;getStatus()}})}
 function setBright(v){document.getElementById('bVal').textContent=v;clearTimeout(toutTimer);toutTimer=setTimeout(()=>{fetch('/api/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({brightness:v})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})},150)}
 function setTout(v){fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeout:v})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
 function setToff(v){fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({toff:v})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
@@ -554,7 +572,8 @@ aq.textContent=(d.aqReady?d.aqLabel:'Warming up')+' ('+d.aqPercent+'%)'
 aq.className=d.aqReady?('aq-'+d.aqLabel.toLowerCase()):''
 }
 document.getElementById('preview').style.background=d.ledOn?d.color:'#1a1a2e'
-if(document.activeElement!==document.getElementById('colorPick'))document.getElementById('colorPick').value=d.color
+const hs=document.getElementById('hueSlider'),ss=document.getElementById('satSlider')
+if(document.activeElement!==hs&&document.activeElement!==ss){const[h,s]=hex2hs(d.color);hs.value=h;ss.value=s;const full=hs2hex(h,100);ss.style.background='linear-gradient(to right,#fff,'+full+')';document.querySelectorAll('.swatches button').forEach(b=>b.classList.toggle('sel',b.dataset.c===d.color.toUpperCase()))}
 if(document.activeElement!==document.getElementById('brightSlider')){document.getElementById('brightSlider').value=d.brightness;document.getElementById('bVal').textContent=d.brightness}
 if(document.activeElement!==document.getElementById('toutInput'))document.getElementById('toutInput').value=d.timeout
 if(document.activeElement!==document.getElementById('toffInput'))document.getElementById('toffInput').value=d.toff
