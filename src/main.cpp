@@ -8,7 +8,9 @@
 #include <ArduinoJson.h>
 #include <DHT.h>
 #include <ArduinoOTA.h>
+#include <Preferences.h>
 #include "secrets.h"
+#include "led_sync.h"
 
 // HLK-LD2410B OUT pin (open-drain, LOW=no one, HIGH=presence)
 #define LD2410_PIN  32
@@ -97,10 +99,18 @@ unsigned long lastAqAlertSent = 0;
 const unsigned long AQ_ALERT_REPEAT_MS = 30UL * 60UL * 1000UL; // re-remind every 30 min while still poor
 
 // --- Slave configuration ---
+// Leave an entry as "" if that slave doesn't exist yet - blank slots are
+// skipped everywhere. Give slaves DHCP reservations in the router so these
+// don't go stale (they were 192.168.1.x once while the LAN is 192.168.0.x,
+// which silently killed unicast sync and blocked the loop on HTTP timeouts).
 #define NUM_SLAVES 2
-const char* slaveIPs[NUM_SLAVES] = {"192.168.1.101", "192.168.1.102"};
+const char* slaveIPs[NUM_SLAVES] = {"192.168.0.65", ""};
 const int slavePort = 80;
+// Liveness is tracked from UDP acks the slaves send back (see led_sync.h),
+// not from whether the IP string parses like before.
 bool slaveOnline[NUM_SLAVES] = {false, false};
+unsigned long slaveLastSeen[NUM_SLAVES] = {0, 0};
+const unsigned long SLAVE_ONLINE_TIMEOUT_MS = 15000;
 unsigned long lastSlaveSync = 0;
 const unsigned long slaveSyncInterval = 3000;
 
@@ -109,18 +119,16 @@ bool lastSentLedOn = false;
 CRGB lastSentColor = CRGB::Black;
 uint8_t lastSentBrightness = 0;
 
-// --- UDP broadcast (fast path for real-time sync) ---
-#define UDP_PORT 4210
+// --- UDP (fast path for real-time sync + ack receive) ---
+#define UDP_PORT LED_SYNC_UDP_PORT
 WiFiUDP udp;
 uint16_t udpSeq = 0;
 
-struct __attribute__((packed)) UdpLedPkt {
-  uint8_t  version;    // = 1
-  uint8_t  on;         // 1=on, 0=off
-  uint8_t  r, g, b;
-  uint8_t  brightness;
-  uint16_t seq;
-};
+// --- Persistent settings (NVS) ---
+Preferences prefs;
+bool settingsDirty = false;
+unsigned long lastSettingsChange = 0;
+const unsigned long SETTINGS_SAVE_DEBOUNCE_MS = 3000; // batch rapid slider drags into one flash write
 
 void setupPins() {
   pinMode(LD2410_PIN, INPUT_PULLUP);
@@ -134,6 +142,39 @@ void setupPins() {
   analogSetPinAttenuation(MIC_PIN, ADC_11db);
   analogSetPinAttenuation(MQ135_PIN, ADC_11db);
   mq135WarmupStart = millis();
+}
+
+void loadSettings() {
+  prefs.begin("ledctl", false);
+  uint8_t m = prefs.getUChar("mode", AUTO);
+  ledMode = m <= SOUND ? (LedMode)m : AUTO;
+  uint32_t c = prefs.getUInt("color", 0xFFFFFF);
+  targetColor = CRGB((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+  brightness = prefs.getUChar("bri", 128);
+  if (brightness < 1) brightness = 1;
+  motionTimeout = prefs.getUInt("tout", 30000);
+  tempOffset = prefs.getFloat("toff", -2.0f);
+  musicFx = prefs.getUChar("fx", 0);
+  if (musicFx > 2) musicFx = 0;
+}
+
+void markSettingsDirty() {
+  settingsDirty = true;
+  lastSettingsChange = millis();
+}
+
+// NVS dedupes unchanged values internally, so this only wears flash when
+// something actually changed.
+void persistSettings() {
+  if (!settingsDirty || millis() - lastSettingsChange < SETTINGS_SAVE_DEBOUNCE_MS) return;
+  settingsDirty = false;
+  prefs.putUChar("mode", (uint8_t)ledMode);
+  prefs.putUInt("color", ((uint32_t)targetColor.r << 16) | ((uint32_t)targetColor.g << 8) | targetColor.b);
+  prefs.putUChar("bri", brightness);
+  prefs.putUInt("tout", motionTimeout);
+  prefs.putFloat("toff", tempOffset);
+  prefs.putUChar("fx", musicFx);
+  Serial.println("[NVS] settings saved");
 }
 
 void readMotionSensor() {
@@ -264,7 +305,15 @@ void updateSoundLEDs() {
 }
 
 void updateLEDs() {
+  // Statics track what's physically on the strip so we only push a frame when
+  // something changed - a full show() costs ~3ms and was running every loop.
+  static int lastShownMode = -1;
+  static bool lastShownOn = false;
+  static CRGB lastShownColor = CRGB::Black;
+  static uint8_t lastShownBri = 0;
+
   if (ledMode == SOUND) {
+    lastShownMode = SOUND; // force a redraw when leaving sound mode
     updateSoundLEDs();
     return;
   }
@@ -285,14 +334,23 @@ void updateLEDs() {
       break;
   }
 
-  if (shouldBeOn) {
-    fill_solid(leds, NUM_LEDS, targetColor);
-    FastLED.setBrightness(brightness);
-  } else {
-    FastLED.clear();
-  }
+  bool changed = (int)ledMode != lastShownMode || shouldBeOn != lastShownOn ||
+                 (shouldBeOn && (targetColor != lastShownColor || brightness != lastShownBri));
 
-  FastLED.show();
+  if (changed) {
+    if (shouldBeOn) {
+      fill_solid(leds, NUM_LEDS, targetColor);
+      FastLED.setBrightness(brightness);
+    } else {
+      FastLED.clear();
+    }
+    FastLED.show();
+
+    lastShownMode = (int)ledMode;
+    lastShownOn = shouldBeOn;
+    lastShownColor = targetColor;
+    lastShownBri = brightness;
+  }
 
   notifySlaves();
 }
@@ -304,8 +362,17 @@ bool getLedOn() {
   return (millis() - lastMotionTime < motionTimeout);
 }
 
-void sendNtfyNotification(const String& title, const String& message, const String& priority, const String& tags) {
-  if (WiFi.status() != WL_CONNECTED) return;
+// TLS + HTTP to ntfy.sh takes seconds; doing it inline froze LEDs, the web UI
+// and OTA for the duration. It now runs in a one-shot background task so the
+// loop never blocks. One send in flight at a time - a dropped alert repeats
+// via the 30-min reminder anyway.
+struct NtfyMsg {
+  String title, message, priority, tags;
+};
+volatile bool ntfyInFlight = false;
+
+void ntfyTask(void* param) {
+  NtfyMsg* m = (NtfyMsg*)param;
 
   WiFiClientSecure client;
   client.setInsecure(); // skip TLS cert validation - acceptable for this hobby use case
@@ -314,22 +381,42 @@ void sendNtfyNotification(const String& title, const String& message, const Stri
   HTTPClient http;
   http.setConnectTimeout(5000);
   String url = String("https://ntfy.sh/") + ntfyTopic;
-  if (!http.begin(client, url)) return;
+  if (http.begin(client, url)) {
+    http.addHeader("Title", m->title);
+    http.addHeader("Priority", m->priority);
+    http.addHeader("Tags", m->tags);
+    int code = http.POST(m->message);
+    Serial.printf("[ntfy] POST %s -> %d\n", url.c_str(), code);
+    http.end();
+  }
 
-  http.addHeader("Title", title);
-  http.addHeader("Priority", priority);
-  http.addHeader("Tags", tags);
-  int code = http.POST(message);
-  Serial.printf("[ntfy] POST %s -> %d\n", url.c_str(), code);
-  http.end();
+  delete m;
+  ntfyInFlight = false;
+  vTaskDelete(NULL);
+}
+
+void sendNtfyNotification(const String& title, const String& message, const String& priority, const String& tags) {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (ntfyInFlight) {
+    Serial.println("[ntfy] send already in flight, dropped");
+    return;
+  }
+
+  NtfyMsg* m = new NtfyMsg{title, message, priority, tags};
+  ntfyInFlight = true;
+  // 10KB stack: TLS handshake is stack-hungry
+  if (xTaskCreate(ntfyTask, "ntfy", 10240, m, 1, NULL) != pdPASS) {
+    delete m;
+    ntfyInFlight = false;
+    Serial.println("[ntfy] task create failed");
+  }
 }
 
 void readMQ135() {
   const int SAMPLES = 10;
   long sum = 0;
   for (int i = 0; i < SAMPLES; i++) {
-    sum += analogRead(MQ135_PIN);
-    delay(2);
+    sum += analogRead(MQ135_PIN); // back-to-back reads still average noise fine; no need to block
   }
   mq135Raw = sum / SAMPLES;
   mq135Voltage = mq135Raw * (3.3f / 4095.0f) / MQ135_DIVIDER_RATIO;
@@ -382,6 +469,40 @@ void sendUdpPkt(IPAddress ip, bool on, CRGB color, uint8_t bri) {
   udp.endPacket();
 }
 
+// Reads slave ack packets (see led_sync.h) and refreshes the online table.
+// This is what makes slaveOnline[] mean "actually responding" rather than
+// "IP string parses".
+void processSlaveAcks() {
+  int sz;
+  while ((sz = udp.parsePacket()) > 0) {
+    if (sz < (int)sizeof(UdpAckPkt)) continue;
+    UdpAckPkt ack;
+    udp.read((uint8_t*)&ack, sizeof(ack));
+    if (ack.version != LED_SYNC_ACK_VERSION) continue;
+
+    IPAddress rip = udp.remoteIP();
+    bool known = false;
+    for (int i = 0; i < NUM_SLAVES; i++) {
+      IPAddress si;
+      if (slaveIPs[i][0] && si.fromString(slaveIPs[i]) && si == rip) {
+        slaveLastSeen[i] = millis();
+        known = true;
+      }
+    }
+    if (!known) {
+      // A slave got the broadcast but isn't in slaveIPs - config is stale.
+      static unsigned long lastUnknownLog = 0;
+      if (millis() - lastUnknownLog > 10000) {
+        lastUnknownLog = millis();
+        Serial.printf("[SYNC] ack from unconfigured slave %s - update slaveIPs[]\n", rip.toString().c_str());
+      }
+    }
+  }
+  for (int i = 0; i < NUM_SLAVES; i++) {
+    slaveOnline[i] = slaveLastSeen[i] != 0 && millis() - slaveLastSeen[i] < SLAVE_ONLINE_TIMEOUT_MS;
+  }
+}
+
 // Pushes an explicit LED state to all slaves (UDP unicast + broadcast, optional
 // HTTP fallback). Used both by the normal notifySlaves() path and directly by
 // sound-reactive mode, which needs to push a fast-changing pulse that doesn't
@@ -394,11 +515,8 @@ void broadcastLedState(bool on, CRGB color, uint8_t bri, bool includeHttp) {
   // 1. UDP unicast to each configured slave (reliable)
   for (int i = 0; i < NUM_SLAVES; i++) {
     IPAddress ip;
-    if (ip.fromString(slaveIPs[i])) {
+    if (slaveIPs[i][0] && ip.fromString(slaveIPs[i])) {
       sendUdpPkt(ip, on, color, bri);
-      slaveOnline[i] = true;
-    } else {
-      slaveOnline[i] = false;
     }
   }
 
@@ -419,9 +537,17 @@ void broadcastLedState(bool on, CRGB color, uint8_t bri, bool includeHttp) {
   String payload;
   serializeJson(doc, payload);
 
+  // connect() to a dead host blocks for its full timeout, so offline slaves
+  // are only retried every 30s instead of every 3s sync tick.
+  static unsigned long lastOfflineHttpTry = 0;
+  bool retryOffline = millis() - lastOfflineHttpTry > 30000;
+  if (retryOffline) lastOfflineHttpTry = millis();
+
   for (int i = 0; i < NUM_SLAVES; i++) {
+    if (!slaveIPs[i][0]) continue;
+    if (!slaveOnline[i] && !retryOffline) continue;
     WiFiClient client;
-    if (client.connect(slaveIPs[i], slavePort, 500)) {
+    if (client.connect(slaveIPs[i], slavePort, 300)) {
       client.printf("POST /set HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %u\r\nConnection: close\r\n\r\n%s",
         slaveIPs[i], payload.length(), payload.c_str());
       client.flush();
@@ -643,6 +769,7 @@ void handleSetMode() {
   else if (mode == "on") ledMode = ON;
   else if (mode == "auto") ledMode = AUTO;
   else if (mode == "sound") ledMode = SOUND;
+  markSettingsDirty();
 
   server.send(200, "application/json", "{\"success\":true}");
 }
@@ -661,9 +788,10 @@ void handleSetLed() {
     }
   }
   if (doc.containsKey("brightness")) {
-    brightness = constrain((int)doc["brightness"], 0, 255);
+    brightness = constrain((int)doc["brightness"], 1, 255); // 1 = UI slider minimum; 0 would look like a dead strip
     FastLED.setBrightness(brightness);
   }
+  markSettingsDirty();
 
   server.send(200, "application/json", "{\"success\":true}");
 }
@@ -675,14 +803,15 @@ void handleSetSettings() {
   if (deserializeJson(doc, server.arg("plain"))) { server.send(400, "application/json", "{\"success\":false}"); return; }
 
   if (doc.containsKey("timeout")) {
-    motionTimeout = (unsigned long)doc["timeout"] * 1000;
+    motionTimeout = (unsigned long)constrain((long)doc["timeout"], 1L, 3600L) * 1000;
   }
   if (doc.containsKey("toff")) {
-    tempOffset = doc["toff"];
+    tempOffset = constrain((float)doc["toff"], -10.0f, 10.0f);
   }
   if (doc.containsKey("musicFx")) {
     musicFx = constrain((int)doc["musicFx"], 0, 2);
   }
+  markSettingsDirty();
 
   server.send(200, "application/json", "{\"success\":true}");
 }
@@ -776,8 +905,15 @@ void processSerialCommands() {
         Serial.println("LED blink test done.");
       } else if (cmdBuffer == "slaves") {
         for (int i = 0; i < NUM_SLAVES; i++) {
-          Serial.printf("Slave %d (%s): %s\n", i + 1, slaveIPs[i],
-            slaveOnline[i] ? "ONLINE" : "OFFLINE");
+          if (!slaveIPs[i][0]) {
+            Serial.printf("Slave %d: (not configured)\n", i + 1);
+          } else if (slaveOnline[i]) {
+            Serial.printf("Slave %d (%s): ONLINE (ack %lus ago)\n", i + 1, slaveIPs[i],
+              (millis() - slaveLastSeen[i]) / 1000);
+          } else {
+            Serial.printf("Slave %d (%s): OFFLINE (%s)\n", i + 1, slaveIPs[i],
+              slaveLastSeen[i] ? "was online earlier" : "never acked");
+          }
         }
       } else if (cmdBuffer == "status") {
         int val = digitalRead(LD2410_PIN);
@@ -828,16 +964,23 @@ void setup() {
   Serial.println("============================================");
   Serial.println();
   Serial.printf("Slaves: %d configured\n", NUM_SLAVES);
-  for (int i = 0; i < NUM_SLAVES; i++) Serial.printf("  Slave %d: %s\n", i + 1, slaveIPs[i]);
+  for (int i = 0; i < NUM_SLAVES; i++)
+    Serial.printf("  Slave %d: %s\n", i + 1, slaveIPs[i][0] ? slaveIPs[i] : "(not configured)");
   Serial.println();
   Serial.println("Type 'help' for diagnostic commands.");
   Serial.println();
 
+  loadSettings(); // before setupPins so the restored brightness is applied
   setupPins();
+  // Without this, "millis() - 0 < timeout" counts boot as recent motion and
+  // AUTO mode lights the strip for the first timeout period after every reboot.
+  lastMotionTime = millis() - motionTimeout - 1;
+
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
   setupServer();
   startWiFi();
+  udp.begin(UDP_PORT); // bound socket: outgoing sync + incoming slave acks
 
   ArduinoOTA.setHostname("esp32-master");
   ArduinoOTA.setPassword(otaPassword);
@@ -888,25 +1031,20 @@ void loop() {
   processSerialCommands();
 
   sampleMic();
+  processSlaveAcks();
+  persistSettings();
 
   unsigned long m = millis();
+  // Single read per interval: the DHT22's minimum sampling period is 2s, so
+  // the old 3-reads-in-300ms "average" was the same measurement three times -
+  // and its delays visibly froze the music animation every 10s.
   if (m - lastSensorRead >= sensorInterval) {
     lastSensorRead = m;
-    float tSum = 0, hSum = 0;
-    int valid = 0;
-    for (int i = 0; i < 3; i++) {
-      float t = dht.readTemperature();
-      float h = dht.readHumidity();
-      if (!isnan(t) && !isnan(h) && t > 0 && t < 50 && h > 0 && h <= 100) {
-        tSum += t;
-        hSum += h;
-        valid++;
-      }
-      delay(100);
-    }
-    if (valid > 0) {
-      currentTemperature = tSum / valid + tempOffset;
-      currentHumidity = hSum / valid;
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    if (!isnan(t) && !isnan(h) && t > 0 && t < 50 && h > 0 && h <= 100) {
+      currentTemperature = t + tempOffset;
+      currentHumidity = h;
     }
   }
 

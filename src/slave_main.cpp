@@ -6,10 +6,11 @@
 #include <ArduinoJson.h>
 #include <ArduinoOTA.h>
 #include "secrets.h"
+#include "led_sync.h"
 
 #define LED_PIN    14
 #define NUM_LEDS   122
-#define UDP_PORT   4210
+#define UDP_PORT   LED_SYNC_UDP_PORT
 
 CRGB leds[NUM_LEDS];
 WebServer server(80);
@@ -24,13 +25,9 @@ unsigned long lastHeartbeat = 0;
 unsigned long pktCount = 0;
 bool netReady = false;
 
-struct __attribute__((packed)) UdpLedPkt {
-  uint8_t  version;
-  uint8_t  on;
-  uint8_t  r, g, b;
-  uint8_t  brightness;
-  uint16_t seq;
-};
+// rate-limit UDP logging: in music mode the master sends 20+ pkt/s
+unsigned long lastUdpLog = 0;
+unsigned long pktsSinceLog = 0;
 
 void setLEDs() {
   if (ledOn) {
@@ -89,6 +86,20 @@ void initServer() {
   server.on("/ping", []() {
     server.send(200, "text/plain", "pong");
   });
+  server.on("/status", []() {
+    StaticJsonDocument<192> doc;
+    doc["on"] = ledOn;
+    char hex[8];
+    snprintf(hex, sizeof(hex), "#%02X%02X%02X", targetColor.r, targetColor.g, targetColor.b);
+    doc["color"] = hex;
+    doc["brightness"] = brightness;
+    doc["pkts"] = pktCount;
+    doc["rssi"] = WiFi.RSSI();
+    doc["uptime"] = millis() / 1000;
+    String r;
+    serializeJson(doc, r);
+    server.send(200, "application/json", r);
+  });
   server.onNotFound([]() {
     server.send(404, "text/plain", "Not found");
   });
@@ -135,25 +146,45 @@ void initNetworking() {
 void processUdp() {
   if (!netReady) return;
 
-  int packetSize = udp.parsePacket();
-  if (packetSize < (int)sizeof(UdpLedPkt)) return;
-
-  UdpLedPkt pkt;
-  udp.read((uint8_t*)&pkt, sizeof(pkt));
-
-  if (pkt.version != 1) {
-    Serial.printf("UDP: bad version %d\n", pkt.version);
-    return;
+  // Drain the whole queue and apply only the newest packet - the master sends
+  // 20Hz in music mode (unicast + broadcast can double that), and processing
+  // one packet per loop meant rendering stale frames and building up latency.
+  bool got = false;
+  UdpLedPkt last;
+  IPAddress masterIp;
+  int packetSize;
+  while ((packetSize = udp.parsePacket()) > 0) {
+    if (packetSize < (int)sizeof(UdpLedPkt)) continue;
+    UdpLedPkt pkt;
+    udp.read((uint8_t*)&pkt, sizeof(pkt));
+    if (pkt.version != LED_SYNC_VERSION) continue;
+    last = pkt;
+    masterIp = udp.remoteIP();
+    got = true;
+    pktCount++;
+    pktsSinceLog++;
   }
+  if (!got) return;
 
-  pktCount++;
-  ledOn = pkt.on;
-  targetColor = CRGB(pkt.r, pkt.g, pkt.b);
-  brightness = pkt.brightness;
-  setLEDs();
+  // Ack back so the master's slaveOnline[] tracking reflects reality
+  UdpAckPkt ack = {LED_SYNC_ACK_VERSION, last.seq};
+  udp.beginPacket(masterIp, UDP_PORT);
+  udp.write((uint8_t*)&ack, sizeof(ack));
+  udp.endPacket();
 
-  Serial.printf("UDP #%u: seq=%u on=%d RGB=%02X%02X%02X bri=%d\n",
-    pktCount, pkt.seq, pkt.on, pkt.r, pkt.g, pkt.b, pkt.brightness);
+  CRGB c(last.r, last.g, last.b);
+  bool changed = (bool)last.on != ledOn || c != targetColor || last.brightness != brightness;
+  ledOn = last.on;
+  targetColor = c;
+  brightness = last.brightness;
+  if (changed) setLEDs(); // skip the ~4ms show() when the state is identical
+
+  if (millis() - lastUdpLog >= 1000) {
+    Serial.printf("UDP: %lu pkt(s)/s, seq=%u on=%d RGB=%02X%02X%02X bri=%d\n",
+      pktsSinceLog, last.seq, last.on, last.r, last.g, last.b, last.brightness);
+    lastUdpLog = millis();
+    pktsSinceLog = 0;
+  }
 }
 
 void setup() {
