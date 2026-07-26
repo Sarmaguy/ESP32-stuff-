@@ -33,16 +33,16 @@
 CRGB leds[NUM_LEDS];
 
 bool getLedOn();
-void notifySlaves(bool force = false);
-void broadcastLedState(bool on, CRGB color, uint8_t bri, bool includeHttp);
+void syncStrips(bool force);
+uint8_t musicBriFor(int strip);
 
 WebServer server(80);
 
 enum LedMode { OFF, ON, AUTO, SOUND };
 LedMode ledMode = AUTO;
 
-CRGB targetColor = CRGB::White;
-uint8_t brightness = 128;
+// Per-strip color/brightness live in stripColor[]/stripBri[] further down -
+// they need NUM_SLAVES, which isn't defined until the slave config block.
 
 DHT dht(DHTPIN, DHTTYPE);
 
@@ -77,6 +77,7 @@ unsigned long lastBeatMs = 0;
 uint8_t beatHue = 0;           // advances on every beat -> color jumps with the music
 uint16_t waveTime = 0;         // animation clock for the Waves effect
 CRGB musicColor = CRGB::Black; // smoothed representative color (also sent to slaves)
+float musicLevel = 0;          // 0..1 glow level for the current frame; each strip scales its own brightness by this
 
 // --- MQ135 air quality sensor ---
 int mq135Raw = 0;          // last averaged raw ADC reading (0-4095, higher = worse air)
@@ -106,7 +107,7 @@ const unsigned long AQ_ALERT_REPEAT_MS = 30UL * 60UL * 1000UL; // re-remind ever
 // don't go stale (they were 192.168.1.x once while the LAN is 192.168.0.x,
 // which silently killed unicast sync and blocked the loop on HTTP timeouts).
 #define NUM_SLAVES 2
-const char* slaveIPs[NUM_SLAVES] = {"192.168.0.65", ""};
+const char* slaveIPs[NUM_SLAVES] = {"192.168.0.65", "192.168.0.71"};
 const int slavePort = 80;
 // Liveness is tracked from UDP acks the slaves send back (see led_sync.h),
 // not from whether the IP string parses like before.
@@ -116,23 +117,32 @@ const unsigned long SLAVE_ONLINE_TIMEOUT_MS = 15000;
 unsigned long lastSlaveSync = 0;
 const unsigned long slaveSyncInterval = 3000;
 
-// --- Per-strip enable ---
+// --- Per-strip state ---
 // Strip 0 is this master's own strip; 1..NUM_SLAVES map to slaveIPs[] in order.
-// Disabling a strip only blanks that one - mode, color and brightness stay
-// shared across whichever strips are still enabled.
+// Each strip carries its own enable, color and brightness; the LED *mode*
+// (off/on/auto/music) and the motion timeout stay global.
 #define NUM_STRIPS (NUM_SLAVES + 1)
-bool stripEnabled[NUM_STRIPS];  // filled by loadSettings(), defaults to all on
+bool stripEnabled[NUM_STRIPS];   // all filled by loadSettings()
+CRGB stripColor[NUM_STRIPS];
+uint8_t stripBri[NUM_STRIPS];
 const char* stripNames[NUM_STRIPS] = {"Main", "Strip 2", "Strip 3"};
 
-bool allStripsEnabled() {
-  for (int i = 0; i < NUM_STRIPS; i++) if (!stripEnabled[i]) return false;
+// True only when every strip would show exactly the same thing. The UDP
+// broadcast can't address individual strips, so it's only safe to send while
+// this holds (see broadcastLedState).
+bool stripsUniform() {
+  for (int i = 0; i < NUM_STRIPS; i++) {
+    if (!stripEnabled[i]) return false;
+    if (stripColor[i] != stripColor[0] || stripBri[i] != stripBri[0]) return false;
+  }
   return true;
 }
 
-// Cache last sent state to avoid flooding slaves
-bool lastSentLedOn = false;
-CRGB lastSentColor = CRGB::Black;
-uint8_t lastSentBrightness = 0;
+// Cache last sent state per slave to avoid flooding them. Indexed by slave, so
+// [i] corresponds to strip i+1.
+bool lastSentOn[NUM_SLAVES] = {false, false};
+CRGB lastSentColor[NUM_SLAVES] = {CRGB::Black, CRGB::Black};
+uint8_t lastSentBri[NUM_SLAVES] = {0, 0};
 
 // --- UDP (fast path for real-time sync + ack receive) ---
 #define UDP_PORT LED_SYNC_UDP_PORT
@@ -148,7 +158,7 @@ const unsigned long SETTINGS_SAVE_DEBOUNCE_MS = 3000; // batch rapid slider drag
 void setupPins() {
   pinMode(LD2410_PIN, INPUT_PULLUP);
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
-  FastLED.setBrightness(brightness);
+  FastLED.setBrightness(stripBri[0]);
   FastLED.clear();
   FastLED.show();
   dht.begin();
@@ -163,16 +173,25 @@ void loadSettings() {
   prefs.begin("ledctl", false);
   uint8_t m = prefs.getUChar("mode", AUTO);
   ledMode = m <= SOUND ? (LedMode)m : AUTO;
-  uint32_t c = prefs.getUInt("color", 0xFFFFFF);
-  targetColor = CRGB((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
-  brightness = prefs.getUChar("bri", 128);
-  if (brightness < 1) brightness = 1;
   motionTimeout = prefs.getUInt("tout", 30000);
   tempOffset = prefs.getFloat("toff", -2.0f);
   musicFx = prefs.getUChar("fx", 0);
   if (musicFx > 2) musicFx = 0;
   uint8_t stripMask = prefs.getUChar("strips", 0xFF); // 0xFF = every strip on
-  for (int i = 0; i < NUM_STRIPS; i++) stripEnabled[i] = stripMask & (1 << i);
+  // Pre-per-strip builds stored one shared "color"/"bri"; fall back to those so
+  // an upgrade keeps the look it had instead of snapping every strip to white.
+  uint32_t legacyColor = prefs.getUInt("color", 0xFFFFFF);
+  uint8_t legacyBri = prefs.getUChar("bri", 128);
+  char key[8];
+  for (int i = 0; i < NUM_STRIPS; i++) {
+    stripEnabled[i] = stripMask & (1 << i);
+    snprintf(key, sizeof(key), "c%d", i);
+    uint32_t c = prefs.getUInt(key, legacyColor);
+    stripColor[i] = CRGB((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+    snprintf(key, sizeof(key), "b%d", i);
+    stripBri[i] = prefs.getUChar(key, legacyBri);
+    if (stripBri[i] < 1) stripBri[i] = 1; // 0 would look like a dead strip
+  }
 }
 
 void markSettingsDirty() {
@@ -186,8 +205,13 @@ void persistSettings() {
   if (!settingsDirty || millis() - lastSettingsChange < SETTINGS_SAVE_DEBOUNCE_MS) return;
   settingsDirty = false;
   prefs.putUChar("mode", (uint8_t)ledMode);
-  prefs.putUInt("color", ((uint32_t)targetColor.r << 16) | ((uint32_t)targetColor.g << 8) | targetColor.b);
-  prefs.putUChar("bri", brightness);
+  char key[8];
+  for (int i = 0; i < NUM_STRIPS; i++) {
+    snprintf(key, sizeof(key), "c%d", i);
+    prefs.putUInt(key, ((uint32_t)stripColor[i].r << 16) | ((uint32_t)stripColor[i].g << 8) | stripColor[i].b);
+    snprintf(key, sizeof(key), "b%d", i);
+    prefs.putUChar(key, stripBri[i]);
+  }
   prefs.putUInt("tout", motionTimeout);
   prefs.putFloat("toff", tempOffset);
   prefs.putUChar("fx", musicFx);
@@ -276,11 +300,16 @@ void sampleMic() {
 // All three effects are designed for *indirect* light (LEDs hidden behind
 // furniture): no per-pixel meters, only whole-glow color/brightness dynamics
 // and broad (tens of LEDs) gradients that read as glow moving along the shelf.
-void updateSoundLEDs() {
-  uint8_t floorBri = min((uint8_t)SOUND_MIN_BRIGHTNESS, brightness);
-  uint8_t range = brightness - floorBri;
-  uint8_t bri;
+// Music drives one shared color for every strip (the effect *is* the color, so
+// per-strip color would be meaningless here), but each strip still scales that
+// against its own brightness setting as a ceiling.
+uint8_t musicBriFor(int strip) {
+  uint8_t ceiling = stripBri[strip];
+  uint8_t floorBri = min((uint8_t)SOUND_MIN_BRIGHTNESS, ceiling);
+  return floorBri + (uint8_t)((ceiling - floorBri) * musicLevel);
+}
 
+void updateSoundLEDs() {
   switch (musicFx) {
     case 1: { // Waves: broad color blobs drift along the strip; music speeds
               // them up, beats surge the whole glow and shift the palette
@@ -290,7 +319,7 @@ void updateSoundLEDs() {
         leds[i] = CHSV(beatHue + (n >> 1), 255, 180 + (n >> 2));
       }
       float lvl = totalEnv * 0.6f + beatPulse * 0.4f;
-      bri = floorBri + (uint8_t)(range * (0.35f + 0.65f * lvl));
+      musicLevel = 0.35f + 0.65f * lvl;
       musicColor = leds[NUM_LEDS / 2];
       break;
     }
@@ -300,7 +329,7 @@ void updateSoundLEDs() {
       CRGB target((uint8_t)(bassEnv * 255), (uint8_t)(midEnv * 220), (uint8_t)(trebEnv * 255));
       nblend(musicColor, target, 60);
       fill_solid(leds, NUM_LEDS, musicColor);
-      bri = floorBri + (uint8_t)(range * (totalEnv * 0.8f + beatPulse * 0.2f));
+      musicLevel = totalEnv * 0.8f + beatPulse * 0.2f;
       break;
     }
     default: { // Pulse: every beat snaps to a new color and punches the
@@ -308,21 +337,21 @@ void updateSoundLEDs() {
       CRGB target = CHSV(beatHue, 240, 255);
       nblend(musicColor, target, beatNow ? 255 : 40);
       fill_gradient(leds, NUM_LEDS, CHSV(beatHue, 240, 255), CHSV(beatHue + 48, 240, 255));
-      float lvl = beatPulse > totalEnv * 0.5f ? beatPulse : totalEnv * 0.5f;
-      bri = floorBri + (uint8_t)(range * lvl);
+      musicLevel = beatPulse > totalEnv * 0.5f ? beatPulse : totalEnv * 0.5f;
       break;
     }
   }
+  musicLevel = constrain(musicLevel, 0.0f, 1.0f);
 
-  // musicColor/bri are still computed when strip 0 is disabled - the slaves
-  // need them; brightness 0 is what blanks the local strip.
-  FastLED.setBrightness(stripEnabled[0] ? bri : 0);
+  // musicColor/musicLevel are still computed when strip 0 is disabled - the
+  // slaves need them; brightness 0 is what blanks the local strip.
+  FastLED.setBrightness(stripEnabled[0] ? musicBriFor(0) : 0);
   FastLED.show();
 
   unsigned long now = millis();
   if (now - lastSoundSlaveSync >= soundSlaveSyncInterval) {
     lastSoundSlaveSync = now;
-    broadcastLedState(true, musicColor, bri, false);
+    syncStrips(true);
   }
 }
 
@@ -356,17 +385,17 @@ void updateLEDs() {
       break;
   }
 
-  // shouldBeOn stays the *logical* state (what notifySlaves broadcasts);
+  // shouldBeOn stays the *logical* state (what syncStrips pushes to slaves);
   // localOn is what this ESP32's own strip actually renders.
   bool localOn = shouldBeOn && stripEnabled[0];
 
   bool changed = (int)ledMode != lastShownMode || localOn != lastShownOn ||
-                 (localOn && (targetColor != lastShownColor || brightness != lastShownBri));
+                 (localOn && (stripColor[0] != lastShownColor || stripBri[0] != lastShownBri));
 
   if (changed) {
     if (localOn) {
-      fill_solid(leds, NUM_LEDS, targetColor);
-      FastLED.setBrightness(brightness);
+      fill_solid(leds, NUM_LEDS, stripColor[0]);
+      FastLED.setBrightness(stripBri[0]);
     } else {
       FastLED.clear();
     }
@@ -374,11 +403,11 @@ void updateLEDs() {
 
     lastShownMode = (int)ledMode;
     lastShownOn = localOn;
-    lastShownColor = targetColor;
-    lastShownBri = brightness;
+    lastShownColor = stripColor[0];
+    lastShownBri = stripBri[0];
   }
 
-  notifySlaves();
+  syncStrips(false);
 }
 
 bool getLedOn() {
@@ -529,39 +558,55 @@ void processSlaveAcks() {
   }
 }
 
-// Pushes an explicit LED state to all slaves (UDP unicast + broadcast, optional
-// HTTP fallback). Used both by the normal notifySlaves() path and directly by
-// sound-reactive mode, which needs to push a fast-changing pulse that doesn't
-// fit the single "on/color/brightness" state notifySlaves() tracks.
-void broadcastLedState(bool on, CRGB color, uint8_t bri, bool includeHttp) {
-  lastSentLedOn = on;
-  lastSentColor = color;
-  lastSentBrightness = bri;
+// Resolves what a given strip should be showing right now. In music mode every
+// strip shares the effect's color but scales it by its own brightness ceiling;
+// otherwise each strip uses its own configured color/brightness.
+void resolveStrip(int strip, bool& outOn, CRGB& outColor, uint8_t& outBri) {
+  outOn = getLedOn() && stripEnabled[strip];
+  if (ledMode == SOUND) {
+    outColor = musicColor;
+    outBri = musicBriFor(strip);
+  } else {
+    outColor = stripColor[strip];
+    outBri = stripBri[strip];
+  }
+}
 
-  // 1. UDP unicast to each configured slave (reliable). This is the only path
-  // that can address a single strip, so it carries the per-strip enable.
+// Pushes each strip its own state. `force` skips the per-strip dedupe and adds
+// the slow HTTP fallback; the periodic 3s tick and config changes use it, while
+// the 20Hz music path leans on the dedupe to stay cheap.
+void syncStrips(bool force) {
+  // 1. UDP unicast per configured slave (reliable). This is the only path that
+  // can address a single strip, so all per-strip state rides on it.
   for (int i = 0; i < NUM_SLAVES; i++) {
     IPAddress ip;
-    if (slaveIPs[i][0] && ip.fromString(slaveIPs[i])) {
-      sendUdpPkt(ip, on && stripEnabled[i + 1], color, bri);
-    }
+    if (!slaveIPs[i][0] || !ip.fromString(slaveIPs[i])) continue;
+
+    bool on; CRGB color; uint8_t bri;
+    resolveStrip(i + 1, on, color, bri);
+    if (!force && on == lastSentOn[i] && color == lastSentColor[i] && bri == lastSentBri[i]) continue;
+    lastSentOn[i] = on;
+    lastSentColor[i] = color;
+    lastSentBri[i] = bri;
+
+    sendUdpPkt(ip, on, color, bri);
   }
 
   // 2. UDP broadcast (auto-discovery, may be blocked by some routers).
-  // The packet format has no strip addressing, so every slave applies it -
-  // a disabled slave would see on=1 here and immediately undo its unicast
-  // off. Skip the broadcast while any strip is disabled; discovery resumes
-  // as soon as everything is back on.
-  if (allStripsEnabled()) {
+  // The packet format has no strip addressing, so every slave applies it - a
+  // strip that is disabled or has its own color would see the shared state
+  // here and immediately undo its unicast. Only broadcast while every strip is
+  // enabled and showing exactly the same thing; discovery resumes once that
+  // holds again.
+  if (stripsUniform()) {
+    bool on; CRGB color; uint8_t bri;
+    resolveStrip(0, on, color, bri);
     IPAddress bcast = WiFi.broadcastIP();
     if (bcast != INADDR_NONE) sendUdpPkt(bcast, on, color, bri);
   }
 
-  // HTTP — slow fallback, only for periodic sync
-  if (!includeHttp) return;
-
-  char hex[8];
-  snprintf(hex, sizeof(hex), "#%02X%02X%02X", color.r, color.g, color.b);
+  // HTTP — slow fallback, only for the periodic sync
+  if (!force) return;
 
   // connect() to a dead host blocks for its full timeout, so offline slaves
   // are only retried every 30s instead of every 3s sync tick.
@@ -573,9 +618,13 @@ void broadcastLedState(bool on, CRGB color, uint8_t bri, bool includeHttp) {
     if (!slaveIPs[i][0]) continue;
     if (!slaveOnline[i] && !retryOffline) continue;
 
-    // Built per slave rather than once - "on" differs by strip.
-    StaticJsonDocument<128> doc;
-    doc["on"] = on && stripEnabled[i + 1];
+    bool on; CRGB color; uint8_t bri;
+    resolveStrip(i + 1, on, color, bri);
+
+    char hex[8];
+    snprintf(hex, sizeof(hex), "#%02X%02X%02X", color.r, color.g, color.b);
+    StaticJsonDocument<128> doc; // built per slave - every field can differ
+    doc["on"] = on;
     doc["color"] = hex;
     doc["brightness"] = bri;
     String payload;
@@ -589,13 +638,6 @@ void broadcastLedState(bool on, CRGB color, uint8_t bri, bool includeHttp) {
       client.stop();
     }
   }
-}
-
-void notifySlaves(bool force) {
-  bool ledOn = getLedOn();
-  if (!force && ledOn == lastSentLedOn && targetColor == lastSentColor && brightness == lastSentBrightness) return;
-
-  broadcastLedState(ledOn, targetColor, brightness, force);
 }
 
 const char MAIN_page[] PROGMEM = R"=====(
@@ -630,6 +672,11 @@ h1{text-align:center;color:#0f3460;margin-bottom:20px;font-size:1.4em}
 .strip-btns button.on{background:#2ecc71;transform:scale(0.97);box-shadow:inset 0 0 10px rgba(0,0,0,0.25)}
 .strip-btns button small{display:block;font-size:0.72em;opacity:.75}
 .strip-btns button:disabled{opacity:.35;cursor:not-allowed;transform:none}
+.sel-btns{display:flex;gap:6px}
+.sel-btns button{flex:1;padding:8px 4px;border:none;border-radius:8px;font-size:0.82em;cursor:pointer;color:#fff;background:#34495e;transition:.2s}
+.sel-btns button.active{background:#e94560;transform:scale(0.96);box-shadow:inset 0 0 10px rgba(0,0,0,0.3)}
+.sel-btns button:disabled{opacity:.35;cursor:not-allowed}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-left:5px;vertical-align:middle;border:1px solid rgba(255,255,255,.35)}
 .aq-good{color:#2ecc71}
 .aq-moderate{color:#f1c40f}
 .aq-poor{color:#e67e22}
@@ -684,6 +731,10 @@ input[type=range]::-moz-range-thumb{width:24px;height:24px;border-radius:50%;bac
 </div>
 </div>
 <div class="ctrl">
+<label>Editing</label>
+<div class="sel-btns" id="selBtns"></div>
+</div>
+<div class="ctrl">
 <label>Color</label>
 <div class="swatches" id="swatches"></div>
 <div class="slide-row"><span class="sl-lab">Hue</span><input type="range" id="hueSlider" min="0" max="360" value="0" oninput="onHS()"></div>
@@ -720,10 +771,11 @@ function hex2hs(x){const r=parseInt(x.substr(1,2),16)/255,g=parseInt(x.substr(3,
 function setHS(h,s){document.getElementById('hueSlider').value=h;document.getElementById('satSlider').value=s;paintHS(h,s)}
 function paintHS(h,s){const full=hs2hex(h,100),cur=hs2hex(h,s);document.getElementById('satSlider').style.background='linear-gradient(to right,#fff,'+full+')';document.getElementById('preview').style.background=cur;document.querySelectorAll('.swatches button').forEach(b=>b.classList.toggle('sel',b.dataset.c===cur))}
 function onHS(){const h=+document.getElementById('hueSlider').value,s=+document.getElementById('satSlider').value;paintHS(h,s);clearTimeout(colTimer);colTimer=setTimeout(()=>sendColor(hs2hex(h,s)),120)}
-function sendColor(c){fetch('/api/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({color:c})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
+let selStrip=-1
+function sendColor(c){fetch('/api/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({strip:selStrip,color:c})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
 
 function setMode(m){fetch('/api/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:m})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
-function setBright(v){document.getElementById('bVal').textContent=v;clearTimeout(toutTimer);toutTimer=setTimeout(()=>{fetch('/api/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({brightness:v})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})},150)}
+function setBright(v){document.getElementById('bVal').textContent=v;clearTimeout(toutTimer);toutTimer=setTimeout(()=>{fetch('/api/led',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({strip:selStrip,brightness:v})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})},150)}
 function setTout(v){fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeout:v})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
 function setToff(v){fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({toff:v})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
 function setFx(n){fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({musicFx:n})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
@@ -740,6 +792,22 @@ stripOn=list.map(s=>s.on)
 function toggleStrip(i){stripOn[i]=!stripOn[i];renderStripsLocal(i);fetch('/api/strips',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({strips:stripOn})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
 function renderStripsLocal(i){document.getElementById('stripBtns').children[i].classList.toggle('on',stripOn[i])}
 
+// "Editing" selector: -1 = all strips, otherwise the strip index the colour and
+// brightness controls below will write to.
+function renderSel(list){
+const d=document.getElementById('selBtns')
+if(d.childElementCount!==list.length+1){
+d.innerHTML=''
+const all=document.createElement('button');all.textContent='All';all.onclick=()=>pickStrip(-1);d.appendChild(all)
+list.forEach((s,i)=>{const b=document.createElement('button');b.onclick=()=>pickStrip(i);d.appendChild(b)})
+}
+d.children[0].classList.toggle('active',selStrip===-1)
+list.forEach((s,i)=>{const b=d.children[i+1]
+b.innerHTML=s.n+'<span class="dot" style="background:'+s.c+'"></span>'
+b.classList.toggle('active',selStrip===i);b.disabled=!s.cfg})
+}
+function pickStrip(i){selStrip=i;getStatus()}
+
 function getStatus(){
 fetch('/api/status').then(r=>r.json()).then(d=>{
 document.getElementById('sLed').textContent=d.ledOn?'ON':'OFF'
@@ -753,10 +821,13 @@ const aq=document.getElementById('sAq')
 aq.textContent=(d.aqReady?d.aqLabel:'Warming up')+' ('+d.aqPercent+'%)'
 aq.className=d.aqReady?('aq-'+d.aqLabel.toLowerCase()):''
 }
-document.getElementById('preview').style.background=d.ledOn?d.color:'#1a1a2e'
+// The colour/brightness controls show whichever strip is being edited; "All"
+// falls back to the top-level values (which mirror strip 0).
+const sel=(selStrip>=0&&d.strips&&d.strips[selStrip])?{c:d.strips[selStrip].c,b:d.strips[selStrip].b}:{c:d.color,b:d.brightness}
+document.getElementById('preview').style.background=d.ledOn?sel.c:'#1a1a2e'
 const hs=document.getElementById('hueSlider'),ss=document.getElementById('satSlider')
-if(document.activeElement!==hs&&document.activeElement!==ss){const[h,s]=hex2hs(d.color);hs.value=h;ss.value=s;const full=hs2hex(h,100);ss.style.background='linear-gradient(to right,#fff,'+full+')';document.querySelectorAll('.swatches button').forEach(b=>b.classList.toggle('sel',b.dataset.c===d.color.toUpperCase()))}
-if(document.activeElement!==document.getElementById('brightSlider')){document.getElementById('brightSlider').value=d.brightness;document.getElementById('bVal').textContent=d.brightness}
+if(document.activeElement!==hs&&document.activeElement!==ss){const[h,s]=hex2hs(sel.c);hs.value=h;ss.value=s;const full=hs2hex(h,100);ss.style.background='linear-gradient(to right,#fff,'+full+')';document.querySelectorAll('.swatches button').forEach(b=>b.classList.toggle('sel',b.dataset.c===sel.c.toUpperCase()))}
+if(document.activeElement!==document.getElementById('brightSlider')){document.getElementById('brightSlider').value=sel.b;document.getElementById('bVal').textContent=sel.b}
 if(document.activeElement!==document.getElementById('toutInput'))document.getElementById('toutInput').value=d.timeout
 if(document.activeElement!==document.getElementById('toffInput'))document.getElementById('toffInput').value=d.toff
 document.querySelectorAll('.mode-btns button').forEach(b=>b.classList.remove('active'))
@@ -766,7 +837,7 @@ else if(d.mode==='auto')document.getElementById('bAuto').classList.add('active')
 else if(d.mode==='sound')document.getElementById('bSound').classList.add('active')
 document.getElementById('fxCtrl').style.display=d.mode==='sound'?'':'none'
 if(typeof d.musicFx!=='undefined')[0,1,2].forEach(n=>document.getElementById('fx'+n).classList.toggle('active',d.musicFx===n))
-if(d.strips)renderStrips(d.strips)
+if(d.strips){renderStrips(d.strips);renderSel(d.strips)}
 }).catch(()=>{})
 }
 
@@ -782,7 +853,7 @@ void handleRoot() {
 }
 
 void handleStatus() {
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<1536> doc;
 
   bool ledOn = getLedOn();
   doc["ledOn"] = ledOn;
@@ -803,21 +874,29 @@ void handleStatus() {
   doc["aqPercent"] = airQualityPercent(mq135Raw);
   doc["aqLabel"] = airQualityLabel(mq135Raw);
   doc["aqReady"] = mq135Ready;
+  doc["rssi"] = WiFi.RSSI(); // weak signal here shows up as flaky OTA long before anything else breaks
 
+  // Top-level color/brightness mirror strip 0 - kept so anything written
+  // against the pre-per-strip API still reads something sensible.
   char hexColor[8];
-  snprintf(hexColor, sizeof(hexColor), "#%02X%02X%02X", targetColor.r, targetColor.g, targetColor.b);
+  snprintf(hexColor, sizeof(hexColor), "#%02X%02X%02X", stripColor[0].r, stripColor[0].g, stripColor[0].b);
   doc["color"] = hexColor;
-  doc["brightness"] = brightness;
+  doc["brightness"] = stripBri[0];
   doc["timeout"] = motionTimeout / 1000;
 
-  // n=name, on=enabled, cfg=strip exists (slave has an IP), up=acking over UDP
+  // n=name, on=enabled, cfg=strip exists (slave has an IP), up=acking over UDP,
+  // c/b=this strip's own color and brightness
+  char stripHex[NUM_STRIPS][8];
   JsonArray strips = doc.createNestedArray("strips");
   for (int i = 0; i < NUM_STRIPS; i++) {
+    snprintf(stripHex[i], sizeof(stripHex[i]), "#%02X%02X%02X", stripColor[i].r, stripColor[i].g, stripColor[i].b);
     JsonObject s = strips.createNestedObject();
     s["n"] = stripNames[i];
     s["on"] = stripEnabled[i];
     s["cfg"] = (i == 0) || slaveIPs[i - 1][0] != '\0';
     s["up"] = (i == 0) ? true : (slaveIPs[i - 1][0] && slaveOnline[i - 1]);
+    s["c"] = stripHex[i];
+    s["b"] = stripBri[i];
   }
 
   String response;
@@ -847,18 +926,31 @@ void handleSetLed() {
   StaticJsonDocument<128> doc;
   if (deserializeJson(doc, server.arg("plain"))) { server.send(400, "application/json", "{\"success\":false}"); return; }
 
+  // "strip": which strip to edit. Omitted or -1 applies to every strip, which
+  // is both the old single-strip behaviour and the UI's "All" selection.
+  int target = doc.containsKey("strip") ? (int)doc["strip"] : -1;
+  if (target >= NUM_STRIPS) { server.send(400, "application/json", "{\"success\":false}"); return; }
+  int from = target < 0 ? 0 : target;
+  int to = target < 0 ? NUM_STRIPS - 1 : target;
+
   if (doc.containsKey("color")) {
     String c = doc["color"];
     if (c.startsWith("#")) {
       long hex = strtol(c.c_str() + 1, NULL, 16);
-      targetColor = CRGB((hex >> 16) & 0xFF, (hex >> 8) & 0xFF, hex & 0xFF);
+      CRGB col((hex >> 16) & 0xFF, (hex >> 8) & 0xFF, hex & 0xFF);
+      for (int i = from; i <= to; i++) stripColor[i] = col;
     }
   }
   if (doc.containsKey("brightness")) {
-    brightness = constrain((int)doc["brightness"], 1, 255); // 1 = UI slider minimum; 0 would look like a dead strip
-    FastLED.setBrightness(brightness);
+    uint8_t b = constrain((int)doc["brightness"], 1, 255); // 1 = UI slider minimum; 0 would look like a dead strip
+    for (int i = from; i <= to; i++) stripBri[i] = b;
+    if (from == 0) FastLED.setBrightness(stripBri[0]);
   }
   markSettingsDirty();
+
+  // Slaves dedupe on their own resolved state, so a change that only affects
+  // one strip still needs a push - force it rather than waiting up to 3s.
+  syncStrips(true);
 
   server.send(200, "application/json", "{\"success\":true}");
 }
@@ -898,8 +990,8 @@ void handleSetStrips() {
   markSettingsDirty();
 
   // The global on/color/brightness didn't change, only who it applies to, so
-  // the normal dedupe in notifySlaves() would swallow this - force the push.
-  notifySlaves(true);
+  // the normal dedupe would swallow this - force the push.
+  syncStrips(true);
 
   server.send(200, "application/json", "{\"success\":true}");
 }
@@ -930,6 +1022,12 @@ void startWiFi() {
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
   WiFi.mode(WIFI_STA);
+  // Modem sleep parks the radio between DTIM beacons, which pushed LAN ping
+  // latency to ~50ms average with 110ms spikes. espota does a synchronous
+  // round-trip per 1KB chunk (~1000 of them) and the device aborts the update
+  // if any single chunk gap exceeds ~1s, so that jitter made OTA fail most
+  // attempts. Costs a little idle power; this node is mains-powered.
+  WiFi.setSleep(false);
   WiFi.begin(ssid, password);
 
   Serial.print("Connecting to WiFi");
@@ -1008,12 +1106,14 @@ void processSerialCommands() {
         }
       } else if (cmdBuffer == "strips") {
         for (int i = 0; i < NUM_STRIPS; i++) {
-          Serial.printf("Strip %d %-8s: %-8s ", i + 1, stripNames[i], stripEnabled[i] ? "ENABLED" : "disabled");
+          Serial.printf("Strip %d %-8s: %-8s #%02X%02X%02X bri=%-3d ", i + 1, stripNames[i],
+            stripEnabled[i] ? "ENABLED" : "disabled",
+            stripColor[i].r, stripColor[i].g, stripColor[i].b, stripBri[i]);
           if (i == 0) Serial.println("[this ESP32]");
           else if (!slaveIPs[i - 1][0]) Serial.println("(no IP configured)");
           else Serial.printf("%s %s\n", slaveIPs[i - 1], slaveOnline[i - 1] ? "ONLINE" : "OFFLINE");
         }
-        if (!allStripsEnabled()) Serial.println("Note: UDP broadcast discovery is paused while a strip is disabled.");
+        if (!stripsUniform()) Serial.println("Note: UDP broadcast discovery is paused while strips differ.");
       } else if (cmdBuffer == "status") {
         int val = digitalRead(LD2410_PIN);
         Serial.printf("OUT pin (GPIO%d): %s\n", LD2410_PIN, val == HIGH ? "PRESENCE" : "NONE");
@@ -1083,6 +1183,12 @@ void setup() {
 
   ArduinoOTA.setHostname("esp32-master");
   ArduinoOTA.setPassword(otaPassword);
+  // ArduinoOTA aborts the transfer if a chunk gap exceeds _ota_timeout, which
+  // defaults to 1000ms. This LAN runs ~50ms average with ~110ms peaks and
+  // intermittent 3-6% loss, so a single TCP retransmit could blow that budget
+  // and drop the update mid-flight - the reason OTA only landed about 1 attempt
+  // in 5. 10s costs nothing on a healthy link and absorbs the bad ones.
+  ArduinoOTA.setTimeout(10000);
   ArduinoOTA.onStart([]() {
     // The normal loop only reaches ArduinoOTA.handle() every ~15ms (sampleMic's
     // 128 analogReads + delay(10) + the odd blocking DHT/TCP call), which
@@ -1135,7 +1241,7 @@ void loop() {
   // sync then so it doesn't fight with that and briefly flash stale color.
   if (ledMode != SOUND && millis() - lastSlaveSync >= slaveSyncInterval) {
     lastSlaveSync = millis();
-    notifySlaves(true);
+    syncStrips(true);
   }
 
   processSerialCommands();

@@ -34,31 +34,41 @@ because it embeds the OTA password. Copy `platformio_local.ini.example` and fill
 
 There are no tests and no linter in this project.
 
-## OTA uploads — check this before adding work to `loop()`
+## OTA uploads are unreliable on the master — read this before chasing it
 
-**This has already broken once and cost a physical USB reflash. Do not regress it.**
+**OTA to the master succeeds roughly 1 attempt in 5. This is a known, measured network
+limitation, not a bug to re-diagnose.** Slave OTA works first try.
 
-`espota.py` streams the image in 1024-byte chunks with a **hardcoded 10s per-chunk timeout**
-(the `--timeout` flag only covers the invitation socket, not the transfer). The ESP32 only
-services the OTA socket when `loop()` reaches `ArduinoOTA.handle()`. The master's loop is
-heavy — `sampleMic()` alone does 128 blocking `analogRead()`s *every iteration regardless of
-mode*, plus `delay(10)`, plus periodic blocking DHT reads and blocking TCP syncs to slaves. That
-starved the socket and aborted uploads at varying points (21–27%), rebooting the device each time.
+Two rules that matter more than the cause:
 
-The guard is in `setup()`/`loop()`: `ArduinoOTA.onStart` sets `otaActive`, blanks the strip, and
-`loop()` early-returns on `otaActive` so it spins on `handle()` alone until the update lands or
-errors out.
+1. **`espota` reports `Error Uploading` even on attempts that succeed.** Its exit code is
+   worthless here. *Always* verify against the device instead — `curl http://<ip>/api/status`
+   and check whether the change you made is actually present. Concluding "it didn't flash" from
+   the exit code has already produced one confidently wrong diagnosis.
+2. **A failed OTA does not brick anything.** The ESP32 rolls back and reboots the old image. But
+   each attempt does reboot it and restart the MQ135 3-minute warm-up, so don't retry blindly.
 
-Therefore:
+Measured cause: espota does a synchronous round-trip per 1024-byte chunk (~1030 of them for this
+image), and the ESP32 aborts the update if any single chunk gap exceeds ~1s. The LAN shows
+50ms average / ~110ms peak latency with intermittent 3–6% packet loss to all three nodes, so a
+retransmit occasionally blows that 1s budget and drops the connection mid-transfer. `--timeout`
+does not help; it only covers the invitation socket, and the transfer timeout at
+`espota.py:178` is hardcoded.
 
-- **Any new blocking or periodic work in `loop()` must sit after the `if (otaActive) return;`
-  guard.** Never add work between `ArduinoOTA.handle()` and that check.
-- Keep `sampleMic()`, `FastLED.show()` (disables interrupts ~3ms), DHT reads, and any
-  `client.connect()` on the guarded side.
-- If an OTA upload fails partway with "Error Uploading", the device is *not* bricked — it rolls
-  back and reboots on the old image. Verify with `curl http://<ip>/api/status` before assuming
-  the worst, and do not retry blindly: each failed attempt reboots the device and restarts the
-  MQ135 3-minute warm-up.
+`WiFi.setSleep(false)` is set in `startWiFi()` for exactly this reason — modem sleep parks the
+radio between DTIM beacons and was a large part of that latency. `/api/status` reports `rssi` so
+link quality is checkable without a serial cable.
+
+If OTA won't land after a handful of tries, **flash over USB** (`pio run -e master -t upload`);
+that always works and is faster than fighting it.
+
+Separately, `loop()` has an `otaActive` guard (`ArduinoOTA.onStart` sets it; `loop()`
+early-returns) so the heavy per-iteration work — `sampleMic()`'s 128 blocking `analogRead()`s,
+`FastLED.show()`, DHT reads, blocking `client.connect()` calls — is skipped during an update.
+Keep any new blocking work in `loop()` on the guarded side of that check. Note this was
+originally added believing loop starvation *was* the OTA cause; it is not (ESP32's
+`ArduinoOTA::handle()` blocks internally in `_runUpdate()` for the whole transfer anyway), but
+the guard is still correct and worth preserving.
 
 ## Architecture
 
