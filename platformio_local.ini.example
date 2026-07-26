@@ -1,0 +1,29 @@
+; Copy this file to platformio_local.ini (gitignored) and fill in the password
+; to match `otaPassword` in include/secrets.h.
+;
+; Upload over Wi-Fi instead of USB:
+;   pio run -e master_ota -t upload
+;   pio run -e slave_ota  -t upload
+;
+; If esp32-master.local / esp32-slave.local don't resolve on your network
+; (mDNS can be flaky on some Windows/router setups), replace upload_port
+; with the device's IP address instead (printed on the serial monitor when
+; it connects to Wi-Fi).
+
+; Tip: if upload fails at "Waiting for device..." (Windows Firewall blocking
+; PlatformIO's bundled python) or at "Sending invitation" (flaky .local/mDNS
+; resolution), pin upload_port to the device IP and use upload_command to run
+; espota.py with a python.exe your firewall allows:
+;   upload_command = <allowed-python> "<...>\framework-arduinoespressif32\tools\espota.py" -i $UPLOAD_PORT -p 3232 --auth=<password> -f $SOURCE -r
+
+[env:master_ota]
+extends = env:master
+upload_protocol = espota
+upload_port = esp32-master.local
+upload_flags = --auth=CHANGE-ME-OTA-PASSWORD
+
+[env:slave_ota]
+extends = env:slave
+upload_protocol = espota
+upload_port = esp32-slave.local
+upload_flags = --auth=CHANGE-ME-OTA-PASSWORD

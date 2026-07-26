@@ -89,10 +89,12 @@ const unsigned long MQ135_WARMUP_MS = 3UL * 60UL * 1000UL; // sensor needs a few
 
 // Raw ADC thresholds - MQ135 output isn't linear/calibrated to real ppm without a
 // proper burn-in + clean-air baseline, so this classifies on the raw reading.
-// Watch the "aq" serial command after a 24-48h burn-in and tune these to your air.
-#define AQ_THRESHOLD_MODERATE  1400
-#define AQ_THRESHOLD_POOR      2000
-#define AQ_THRESHOLD_HAZARDOUS 2800
+// Calibrated 2026-07-26 against this sensor/divider: clean-air baseline ~55-66,
+// breathing directly on the sensor (CO2/moisture spike) peaked ~125. Re-check
+// with the "aq" serial command / /api/status if you change the sensor or divider.
+#define AQ_THRESHOLD_MODERATE  90
+#define AQ_THRESHOLD_POOR      115
+#define AQ_THRESHOLD_HAZARDOUS 160
 
 bool aqAlertActive = false;
 unsigned long lastAqAlertSent = 0;
@@ -113,6 +115,19 @@ unsigned long slaveLastSeen[NUM_SLAVES] = {0, 0};
 const unsigned long SLAVE_ONLINE_TIMEOUT_MS = 15000;
 unsigned long lastSlaveSync = 0;
 const unsigned long slaveSyncInterval = 3000;
+
+// --- Per-strip enable ---
+// Strip 0 is this master's own strip; 1..NUM_SLAVES map to slaveIPs[] in order.
+// Disabling a strip only blanks that one - mode, color and brightness stay
+// shared across whichever strips are still enabled.
+#define NUM_STRIPS (NUM_SLAVES + 1)
+bool stripEnabled[NUM_STRIPS];  // filled by loadSettings(), defaults to all on
+const char* stripNames[NUM_STRIPS] = {"Main", "Strip 2", "Strip 3"};
+
+bool allStripsEnabled() {
+  for (int i = 0; i < NUM_STRIPS; i++) if (!stripEnabled[i]) return false;
+  return true;
+}
 
 // Cache last sent state to avoid flooding slaves
 bool lastSentLedOn = false;
@@ -156,6 +171,8 @@ void loadSettings() {
   tempOffset = prefs.getFloat("toff", -2.0f);
   musicFx = prefs.getUChar("fx", 0);
   if (musicFx > 2) musicFx = 0;
+  uint8_t stripMask = prefs.getUChar("strips", 0xFF); // 0xFF = every strip on
+  for (int i = 0; i < NUM_STRIPS; i++) stripEnabled[i] = stripMask & (1 << i);
 }
 
 void markSettingsDirty() {
@@ -174,6 +191,9 @@ void persistSettings() {
   prefs.putUInt("tout", motionTimeout);
   prefs.putFloat("toff", tempOffset);
   prefs.putUChar("fx", musicFx);
+  uint8_t stripMask = 0;
+  for (int i = 0; i < NUM_STRIPS; i++) if (stripEnabled[i]) stripMask |= (1 << i);
+  prefs.putUChar("strips", stripMask);
   Serial.println("[NVS] settings saved");
 }
 
@@ -294,7 +314,9 @@ void updateSoundLEDs() {
     }
   }
 
-  FastLED.setBrightness(bri);
+  // musicColor/bri are still computed when strip 0 is disabled - the slaves
+  // need them; brightness 0 is what blanks the local strip.
+  FastLED.setBrightness(stripEnabled[0] ? bri : 0);
   FastLED.show();
 
   unsigned long now = millis();
@@ -334,11 +356,15 @@ void updateLEDs() {
       break;
   }
 
-  bool changed = (int)ledMode != lastShownMode || shouldBeOn != lastShownOn ||
-                 (shouldBeOn && (targetColor != lastShownColor || brightness != lastShownBri));
+  // shouldBeOn stays the *logical* state (what notifySlaves broadcasts);
+  // localOn is what this ESP32's own strip actually renders.
+  bool localOn = shouldBeOn && stripEnabled[0];
+
+  bool changed = (int)ledMode != lastShownMode || localOn != lastShownOn ||
+                 (localOn && (targetColor != lastShownColor || brightness != lastShownBri));
 
   if (changed) {
-    if (shouldBeOn) {
+    if (localOn) {
       fill_solid(leds, NUM_LEDS, targetColor);
       FastLED.setBrightness(brightness);
     } else {
@@ -347,7 +373,7 @@ void updateLEDs() {
     FastLED.show();
 
     lastShownMode = (int)ledMode;
-    lastShownOn = shouldBeOn;
+    lastShownOn = localOn;
     lastShownColor = targetColor;
     lastShownBri = brightness;
   }
@@ -512,30 +538,30 @@ void broadcastLedState(bool on, CRGB color, uint8_t bri, bool includeHttp) {
   lastSentColor = color;
   lastSentBrightness = bri;
 
-  // 1. UDP unicast to each configured slave (reliable)
+  // 1. UDP unicast to each configured slave (reliable). This is the only path
+  // that can address a single strip, so it carries the per-strip enable.
   for (int i = 0; i < NUM_SLAVES; i++) {
     IPAddress ip;
     if (slaveIPs[i][0] && ip.fromString(slaveIPs[i])) {
-      sendUdpPkt(ip, on, color, bri);
+      sendUdpPkt(ip, on && stripEnabled[i + 1], color, bri);
     }
   }
 
-  // 2. UDP broadcast (auto-discovery, may be blocked by some routers)
-  IPAddress bcast = WiFi.broadcastIP();
-  if (bcast != INADDR_NONE) sendUdpPkt(bcast, on, color, bri);
+  // 2. UDP broadcast (auto-discovery, may be blocked by some routers).
+  // The packet format has no strip addressing, so every slave applies it -
+  // a disabled slave would see on=1 here and immediately undo its unicast
+  // off. Skip the broadcast while any strip is disabled; discovery resumes
+  // as soon as everything is back on.
+  if (allStripsEnabled()) {
+    IPAddress bcast = WiFi.broadcastIP();
+    if (bcast != INADDR_NONE) sendUdpPkt(bcast, on, color, bri);
+  }
 
   // HTTP — slow fallback, only for periodic sync
   if (!includeHttp) return;
 
-  StaticJsonDocument<128> doc;
-  doc["on"] = on;
   char hex[8];
   snprintf(hex, sizeof(hex), "#%02X%02X%02X", color.r, color.g, color.b);
-  doc["color"] = hex;
-  doc["brightness"] = bri;
-
-  String payload;
-  serializeJson(doc, payload);
 
   // connect() to a dead host blocks for its full timeout, so offline slaves
   // are only retried every 30s instead of every 3s sync tick.
@@ -546,6 +572,15 @@ void broadcastLedState(bool on, CRGB color, uint8_t bri, bool includeHttp) {
   for (int i = 0; i < NUM_SLAVES; i++) {
     if (!slaveIPs[i][0]) continue;
     if (!slaveOnline[i] && !retryOffline) continue;
+
+    // Built per slave rather than once - "on" differs by strip.
+    StaticJsonDocument<128> doc;
+    doc["on"] = on && stripEnabled[i + 1];
+    doc["color"] = hex;
+    doc["brightness"] = bri;
+    String payload;
+    serializeJson(doc, payload);
+
     WiFiClient client;
     if (client.connect(slaveIPs[i], slavePort, 300)) {
       client.printf("POST /set HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %u\r\nConnection: close\r\n\r\n%s",
@@ -590,6 +625,11 @@ h1{text-align:center;color:#0f3460;margin-bottom:20px;font-size:1.4em}
 .fx-btns{display:flex;gap:8px}
 .fx-btns button{flex:1;padding:9px;border:none;border-radius:10px;font-size:0.9em;cursor:pointer;color:#fff;background:#34495e;transition:.2s}
 .fx-btns button.active{background:#9b59b6;transform:scale(0.95);box-shadow:inset 0 0 10px rgba(0,0,0,0.4)}
+.strip-btns{display:flex;gap:8px}
+.strip-btns button{flex:1;padding:9px 4px;border:none;border-radius:10px;font-size:0.9em;cursor:pointer;color:#fff;background:#34495e;transition:.2s;line-height:1.35}
+.strip-btns button.on{background:#2ecc71;transform:scale(0.97);box-shadow:inset 0 0 10px rgba(0,0,0,0.25)}
+.strip-btns button small{display:block;font-size:0.72em;opacity:.75}
+.strip-btns button:disabled{opacity:.35;cursor:not-allowed;transform:none}
 .aq-good{color:#2ecc71}
 .aq-moderate{color:#f1c40f}
 .aq-poor{color:#e67e22}
@@ -630,6 +670,10 @@ input[type=range]::-moz-range-thumb{width:24px;height:24px;border-radius:50%;bac
 <button class="btn-on" id="bOn" onclick="setMode('on')">On</button>
 <button class="btn-auto" id="bAuto" onclick="setMode('auto')">Auto</button>
 <button class="btn-sound" id="bSound" onclick="setMode('sound')">Music</button>
+</div>
+<div class="ctrl">
+<label>Strips</label>
+<div class="strip-btns" id="stripBtns"></div>
 </div>
 <div class="ctrl" id="fxCtrl" style="display:none">
 <label>Music effect</label>
@@ -684,6 +728,18 @@ function setTout(v){fetch('/api/settings',{method:'POST',headers:{'Content-Type'
 function setToff(v){fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({toff:v})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
 function setFx(n){fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({musicFx:n})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
 
+let stripOn=[]
+function renderStrips(list){
+const d=document.getElementById('stripBtns')
+if(d.childElementCount!==list.length){d.innerHTML='';list.forEach((s,i)=>{const b=document.createElement('button');b.onclick=()=>toggleStrip(i);d.appendChild(b)})}
+list.forEach((s,i)=>{const b=d.children[i]
+b.innerHTML=s.n+'<small>'+(s.cfg?(s.up?'online':'offline'):'no IP')+'</small>'
+b.classList.toggle('on',s.on);b.disabled=!s.cfg})
+stripOn=list.map(s=>s.on)
+}
+function toggleStrip(i){stripOn[i]=!stripOn[i];renderStripsLocal(i);fetch('/api/strips',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({strips:stripOn})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
+function renderStripsLocal(i){document.getElementById('stripBtns').children[i].classList.toggle('on',stripOn[i])}
+
 function getStatus(){
 fetch('/api/status').then(r=>r.json()).then(d=>{
 document.getElementById('sLed').textContent=d.ledOn?'ON':'OFF'
@@ -710,6 +766,7 @@ else if(d.mode==='auto')document.getElementById('bAuto').classList.add('active')
 else if(d.mode==='sound')document.getElementById('bSound').classList.add('active')
 document.getElementById('fxCtrl').style.display=d.mode==='sound'?'':'none'
 if(typeof d.musicFx!=='undefined')[0,1,2].forEach(n=>document.getElementById('fx'+n).classList.toggle('active',d.musicFx===n))
+if(d.strips)renderStrips(d.strips)
 }).catch(()=>{})
 }
 
@@ -725,7 +782,7 @@ void handleRoot() {
 }
 
 void handleStatus() {
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<1024> doc;
 
   bool ledOn = getLedOn();
   doc["ledOn"] = ledOn;
@@ -752,6 +809,16 @@ void handleStatus() {
   doc["color"] = hexColor;
   doc["brightness"] = brightness;
   doc["timeout"] = motionTimeout / 1000;
+
+  // n=name, on=enabled, cfg=strip exists (slave has an IP), up=acking over UDP
+  JsonArray strips = doc.createNestedArray("strips");
+  for (int i = 0; i < NUM_STRIPS; i++) {
+    JsonObject s = strips.createNestedObject();
+    s["n"] = stripNames[i];
+    s["on"] = stripEnabled[i];
+    s["cfg"] = (i == 0) || slaveIPs[i - 1][0] != '\0';
+    s["up"] = (i == 0) ? true : (slaveIPs[i - 1][0] && slaveOnline[i - 1]);
+  }
 
   String response;
   serializeJson(doc, response);
@@ -816,6 +883,27 @@ void handleSetSettings() {
   server.send(200, "application/json", "{\"success\":true}");
 }
 
+void handleSetStrips() {
+  if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"success\":false}"); return; }
+
+  StaticJsonDocument<192> doc;
+  if (deserializeJson(doc, server.arg("plain"))) { server.send(400, "application/json", "{\"success\":false}"); return; }
+
+  JsonArray arr = doc["strips"];
+  if (arr.isNull()) { server.send(400, "application/json", "{\"success\":false}"); return; }
+
+  for (int i = 0; i < NUM_STRIPS && i < (int)arr.size(); i++) {
+    stripEnabled[i] = arr[i].as<bool>();
+  }
+  markSettingsDirty();
+
+  // The global on/color/brightness didn't change, only who it applies to, so
+  // the normal dedupe in notifySlaves() would swallow this - force the push.
+  notifySlaves(true);
+
+  server.send(200, "application/json", "{\"success\":true}");
+}
+
 void handleNotFound() {
   String msg = "File Not Found\nURI: " + server.uri();
   server.send(404, "text/plain", msg);
@@ -824,6 +912,7 @@ void handleNotFound() {
 unsigned long lastWiFiAttempt = 0;
 unsigned long lastSerialPrint = 0;
 const unsigned long serialPrintInterval = 2000;
+volatile bool otaActive = false; // set in ArduinoOTA.onStart, see loop()
 
 void setupServer() {
   server.on("/", handleRoot);
@@ -831,6 +920,7 @@ void setupServer() {
   server.on("/api/mode", HTTP_POST, handleSetMode);
   server.on("/api/led", HTTP_POST, handleSetLed);
   server.on("/api/settings", HTTP_POST, handleSetSettings);
+  server.on("/api/strips", HTTP_POST, handleSetStrips);
   server.onNotFound(handleNotFound);
   server.begin();
   Serial.println("Server started");
@@ -878,6 +968,7 @@ void processSerialCommands() {
         Serial.println("  pin        - Read raw pin voltage state");
         Serial.println("  blink      - Blink LED strip 3x (test LEDs)");
         Serial.println("  slaves     - Show slave connection status");
+        Serial.println("  strips     - Show which LED strips are enabled");
         Serial.println("  status     - Show all status");
         Serial.println("  mic        - Read MAX9814 mic level");
         Serial.println("  aq         - Read MQ135 air quality sensor");
@@ -915,6 +1006,14 @@ void processSerialCommands() {
               slaveLastSeen[i] ? "was online earlier" : "never acked");
           }
         }
+      } else if (cmdBuffer == "strips") {
+        for (int i = 0; i < NUM_STRIPS; i++) {
+          Serial.printf("Strip %d %-8s: %-8s ", i + 1, stripNames[i], stripEnabled[i] ? "ENABLED" : "disabled");
+          if (i == 0) Serial.println("[this ESP32]");
+          else if (!slaveIPs[i - 1][0]) Serial.println("(no IP configured)");
+          else Serial.printf("%s %s\n", slaveIPs[i - 1], slaveOnline[i - 1] ? "ONLINE" : "OFFLINE");
+        }
+        if (!allStripsEnabled()) Serial.println("Note: UDP broadcast discovery is paused while a strip is disabled.");
       } else if (cmdBuffer == "status") {
         int val = digitalRead(LD2410_PIN);
         Serial.printf("OUT pin (GPIO%d): %s\n", LD2410_PIN, val == HIGH ? "PRESENCE" : "NONE");
@@ -984,9 +1083,19 @@ void setup() {
 
   ArduinoOTA.setHostname("esp32-master");
   ArduinoOTA.setPassword(otaPassword);
-  ArduinoOTA.onStart([]() { Serial.println("OTA: start"); });
+  ArduinoOTA.onStart([]() {
+    // The normal loop only reaches ArduinoOTA.handle() every ~15ms (sampleMic's
+    // 128 analogReads + delay(10) + the odd blocking DHT/TCP call), which
+    // starves the OTA socket and aborts the transfer partway. Park the strip
+    // and let loop() spin on handle() alone until the update finishes.
+    otaActive = true;
+    FastLED.clear();
+    FastLED.show();
+    Serial.println("OTA: start");
+  });
   ArduinoOTA.onEnd([]() { Serial.println("OTA: done"); });
   ArduinoOTA.onError([](ota_error_t e) {
+    otaActive = false; // failed update: fall back to normal loop duties
     Serial.printf("OTA: error %d\n", e);
   });
   ArduinoOTA.begin();
@@ -995,6 +1104,7 @@ void setup() {
 
 void loop() {
   ArduinoOTA.handle();
+  if (otaActive) return; // nothing else until the update lands (or errors out)
 
   if (WiFi.status() == WL_CONNECTED) {
     server.handleClient();
