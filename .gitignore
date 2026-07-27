@@ -18,6 +18,9 @@ include/secrets.h
 # OTA upload config with password (copy platformio_local.ini.example and fill in)
 platformio_local.ini
 
+# Air quality calibration logs (aq_log.ps1 output)
+aq_log.csv
+
 # OS files
 .DS_Store
 Thumbs.db

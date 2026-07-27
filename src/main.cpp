@@ -9,6 +9,7 @@
 #include <DHT.h>
 #include <ArduinoOTA.h>
 #include <Preferences.h>
+#include <time.h>
 #include "secrets.h"
 #include "led_sync.h"
 
@@ -35,6 +36,7 @@ CRGB leds[NUM_LEDS];
 bool getLedOn();
 void syncStrips(bool force);
 uint8_t musicBriFor(int strip);
+void sanitizeAqThresholds();
 
 WebServer server(80);
 
@@ -90,12 +92,64 @@ const unsigned long MQ135_WARMUP_MS = 3UL * 60UL * 1000UL; // sensor needs a few
 
 // Raw ADC thresholds - MQ135 output isn't linear/calibrated to real ppm without a
 // proper burn-in + clean-air baseline, so this classifies on the raw reading.
-// Calibrated 2026-07-26 against this sensor/divider: clean-air baseline ~55-66,
-// breathing directly on the sensor (CO2/moisture spike) peaked ~125. Re-check
-// with the "aq" serial command / /api/status if you change the sensor or divider.
-#define AQ_THRESHOLD_MODERATE  90
-#define AQ_THRESHOLD_POOR      115
-#define AQ_THRESHOLD_HAZARDOUS 160
+//
+// These are RUNTIME settings (NVS-backed, editable from the web UI and the "aqset"
+// serial command), not constants, because the sensor's baseline drifts: it moved
+// from ~55-66 on 2026-07-26 to a steady ~111 on 2026-07-27 in a room that smelled
+// fine, which made the old 90/115/160 fire alerts on ordinary air. Retune against
+// the live raw value on the page rather than reflashing.
+//
+// Defaults below assume a fresh-air floor near ~105 and keep the deltas the
+// 2026-07-26 calibration implied (moderate ~+30, poor ~+55, hazardous ~+100 over
+// baseline; breathing straight onto the sensor was ~+60).
+#define AQ_DEFAULT_MODERATE  130
+#define AQ_DEFAULT_POOR      155
+#define AQ_DEFAULT_HAZARDOUS 195
+
+int aqThreshModerate  = AQ_DEFAULT_MODERATE;
+int aqThreshPoor      = AQ_DEFAULT_POOR;
+int aqThreshHazardous = AQ_DEFAULT_HAZARDOUS;
+
+// ~10 minutes of history (one slot per minute) so the UI can say whether the air
+// is getting better or worse, which a single instantaneous number never shows.
+#define AQ_HIST_SLOTS 10
+int aqHist[AQ_HIST_SLOTS];
+uint8_t aqHistCount = 0;   // filled slots, saturates at AQ_HIST_SLOTS
+uint8_t aqHistIdx = 0;     // next slot to write = oldest sample once wrapped
+unsigned long lastAqHist = 0;
+const unsigned long AQ_HIST_INTERVAL = 60000;
+
+// --- 24h air quality history (backs the web UI's graph) ---
+// One bucket per 5 minutes, 288 buckets = exactly 24h (576 bytes per array).
+// Each bucket keeps the mean of the ~150 raw reads that land in it *and* their
+// peak, because a 5-minute mean on its own smooths away precisely the short
+// spikes (cooking, aerosols, breathing on the sensor) the graph exists to show.
+#define AQ_DAY_SLOTS    288
+#define AQ_DAY_BUCKET_S 300
+#define AQ_DAY_EMPTY    -1
+
+int16_t aqDayAvg[AQ_DAY_SLOTS];
+int16_t aqDayPeak[AQ_DAY_SLOTS];
+uint16_t aqDayNewestIdx = 0;     // slot holding the bucket currently being filled
+uint32_t aqDayNewestBucket = 0;  // that bucket's number (epoch / AQ_DAY_BUCKET_S)
+bool aqDayHasData = false;
+uint32_t aqBucketSum = 0;        // running mean + peak of the open bucket. Both are
+uint16_t aqBucketN = 0;          // rewritten into the slot on every sample, so the
+int16_t aqBucketPeak = 0;        // newest point on the graph is always live.
+
+// Buckets are keyed to wall-clock time, which is what lets the ring survive a
+// reboot: without a clock there is no way to know how long the node was off, so
+// no way to place the restored samples. Falls back to a monotonic count when NTP
+// never lands - buckets still advance correctly, the UI just labels the x-axis
+// relative ("-6h") instead of as clock times, and nothing is persisted.
+bool aqClockSynced = false;
+bool aqDayPending = false;       // loaded from NVS, not yet realigned against the clock
+uint32_t aqDayStoredBucket = 0;
+uint16_t aqDayStoredIdx = 0;
+unsigned long lastAqDaySave = 0;
+// ~2.3KB of blob per write, so this is deliberately not per bucket. A reboot
+// loses at most this much history (OTA flushes on its way out, see onStart).
+const unsigned long AQ_DAY_SAVE_INTERVAL = 30UL * 60UL * 1000UL;
 
 bool aqAlertActive = false;
 unsigned long lastAqAlertSent = 0;
@@ -177,6 +231,10 @@ void loadSettings() {
   tempOffset = prefs.getFloat("toff", -2.0f);
   musicFx = prefs.getUChar("fx", 0);
   if (musicFx > 2) musicFx = 0;
+  aqThreshModerate  = prefs.getInt("aqm", AQ_DEFAULT_MODERATE);
+  aqThreshPoor      = prefs.getInt("aqp", AQ_DEFAULT_POOR);
+  aqThreshHazardous = prefs.getInt("aqh", AQ_DEFAULT_HAZARDOUS);
+  sanitizeAqThresholds();
   uint8_t stripMask = prefs.getUChar("strips", 0xFF); // 0xFF = every strip on
   // Pre-per-strip builds stored one shared "color"/"bri"; fall back to those so
   // an upgrade keeps the look it had instead of snapping every strip to white.
@@ -215,6 +273,9 @@ void persistSettings() {
   prefs.putUInt("tout", motionTimeout);
   prefs.putFloat("toff", tempOffset);
   prefs.putUChar("fx", musicFx);
+  prefs.putInt("aqm", aqThreshModerate);
+  prefs.putInt("aqp", aqThreshPoor);
+  prefs.putInt("aqh", aqThreshHazardous);
   uint8_t stripMask = 0;
   for (int i = 0; i < NUM_STRIPS; i++) if (stripEnabled[i]) stripMask |= (1 << i);
   prefs.putUChar("strips", stripMask);
@@ -478,35 +539,171 @@ void readMQ135() {
 }
 
 const char* airQualityLabel(int raw) {
-  if (raw < AQ_THRESHOLD_MODERATE) return "Good";
-  if (raw < AQ_THRESHOLD_POOR) return "Moderate";
-  if (raw < AQ_THRESHOLD_HAZARDOUS) return "Poor";
+  if (raw < aqThreshModerate) return "Good";
+  if (raw < aqThreshPoor) return "Moderate";
+  if (raw < aqThreshHazardous) return "Poor";
   return "Hazardous";
 }
 
+// The bands only mean anything if they stay ordered - a UI or serial edit that
+// crosses two of them over would make airQualityLabel() skip a band entirely.
+void sanitizeAqThresholds() {
+  aqThreshModerate  = constrain(aqThreshModerate, 1, 4093);
+  aqThreshPoor      = constrain(aqThreshPoor, aqThreshModerate + 1, 4094);
+  aqThreshHazardous = constrain(aqThreshHazardous, aqThreshPoor + 1, 4095);
+}
+
+// Where the reading sits across the whole Good..Hazardous span, so the number
+// next to the label actually tracks the label (the old version mapped the raw
+// value onto the full 0-4095 ADC range and read "Moderate (2%)").
 uint8_t airQualityPercent(int raw) {
-  return (uint8_t)constrain((long)map(raw, 0, 4095, 0, 100), 0L, 100L);
+  int top = aqThreshHazardous + (aqThreshHazardous - aqThreshPoor); // headroom above "hazardous"
+  if (top < 1) top = 1;
+  return (uint8_t)constrain((long)map(raw, 0, top, 0, 100), 0L, 100L);
 }
 
 void checkAirQualityAlert(int raw) {
   if (!mq135Ready) return;
 
-  bool isPoor = raw >= AQ_THRESHOLD_POOR;
+  bool isPoor = raw >= aqThreshPoor;
   unsigned long now = millis();
 
   if (isPoor) {
     if (!aqAlertActive || (now - lastAqAlertSent >= AQ_ALERT_REPEAT_MS)) {
-      bool hazardous = raw >= AQ_THRESHOLD_HAZARDOUS;
+      bool hazardous = raw >= aqThreshHazardous;
       String label = hazardous ? "HAZARDOUS" : "POOR";
-      String msg = "Air quality is " + label + " (index " + String(airQualityPercent(raw)) + "%). Consider ventilating the room.";
+      String msg = "Air quality is " + label + " (raw " + String(raw) + ", alert level " +
+        String(hazardous ? aqThreshHazardous : aqThreshPoor) + "). Consider ventilating the room.";
       sendNtfyNotification("Air Quality Alert", msg, hazardous ? "urgent" : "high", "warning");
       aqAlertActive = true;
       lastAqAlertSent = now;
     }
-  } else if (aqAlertActive && raw < AQ_THRESHOLD_MODERATE) {
+  } else if (aqAlertActive && raw < aqThreshModerate) {
     sendNtfyNotification("Air Quality Normal", "Air quality has returned to normal levels.", "default", "white_check_mark");
     aqAlertActive = false;
   }
+}
+
+// ============================================================
+// 24h AIR QUALITY HISTORY
+// ============================================================
+
+// Wall clock once NTP has landed, otherwise a monotonic seconds count. Both
+// bucket identically; only what the UI can label the x-axis with differs.
+uint32_t aqNowSeconds() {
+  time_t t = time(nullptr);
+  if (t > 1700000000) { aqClockSynced = true; return (uint32_t)t; } // anything past 2023 means NTP replied
+  return (uint32_t)(millis() / 1000);
+}
+
+void aqDayClear() {
+  for (int i = 0; i < AQ_DAY_SLOTS; i++) {
+    aqDayAvg[i] = AQ_DAY_EMPTY;
+    aqDayPeak[i] = AQ_DAY_EMPTY;
+  }
+  aqDayNewestIdx = 0;
+  aqBucketSum = 0; aqBucketN = 0; aqBucketPeak = 0;
+  aqDayHasData = false;
+}
+
+// Walk the ring forward over time that produced no samples, leaving those slots
+// empty so the graph draws a break instead of interpolating across the gap.
+void aqDayAdvance(uint32_t buckets) {
+  for (uint32_t k = 0; k < buckets; k++) {
+    aqDayNewestIdx = (aqDayNewestIdx + 1) % AQ_DAY_SLOTS;
+    aqDayAvg[aqDayNewestIdx] = AQ_DAY_EMPTY;
+    aqDayPeak[aqDayNewestIdx] = AQ_DAY_EMPTY;
+  }
+}
+
+void aqDayRecord(int raw) {
+  uint32_t bucket = aqNowSeconds() / AQ_DAY_BUCKET_S;
+
+  if (!aqDayHasData) {
+    aqDayNewestBucket = bucket;
+    aqDayHasData = true;
+  } else if (bucket > aqDayNewestBucket) {
+    uint32_t skip = bucket - aqDayNewestBucket;
+    if (skip >= AQ_DAY_SLOTS) {
+      aqDayClear();       // everything on hand is older than the window
+      aqDayHasData = true;
+    } else {
+      aqDayAdvance(skip);
+    }
+    aqDayNewestBucket = bucket;
+    aqBucketSum = 0; aqBucketN = 0; aqBucketPeak = 0;
+  } else if (bucket < aqDayNewestBucket) {
+    // Clock went backwards - in practice only when NTP lands after history
+    // already started on the millis() fallback. Those samples can't be placed.
+    aqDayClear();
+    aqDayNewestBucket = bucket;
+    aqDayHasData = true;
+  }
+
+  aqBucketSum += raw;
+  aqBucketN++;
+  if (raw > aqBucketPeak) aqBucketPeak = raw;
+  aqDayAvg[aqDayNewestIdx] = (int16_t)(aqBucketSum / aqBucketN);
+  aqDayPeak[aqDayNewestIdx] = aqBucketPeak;
+}
+
+void aqDaySave() {
+  if (!aqClockSynced || !aqDayHasData || aqDayPending) return; // relative timelines can't be resumed
+  // Say so if this ever fails: a full NVS would otherwise just quietly lose the
+  // history at every reboot with nothing on the wire to explain it.
+  if (prefs.putBytes("aqda", aqDayAvg, sizeof(aqDayAvg)) != sizeof(aqDayAvg) ||
+      prefs.putBytes("aqdp", aqDayPeak, sizeof(aqDayPeak)) != sizeof(aqDayPeak)) {
+    Serial.println("[AQ] NVS write of the 24h history failed");
+    return;
+  }
+  prefs.putUInt("aqdb", aqDayNewestBucket);
+  prefs.putUShort("aqdi", aqDayNewestIdx);
+}
+
+void aqDayLoad() {
+  aqDayClear();
+  if (prefs.getBytesLength("aqda") != sizeof(aqDayAvg)) return;
+  prefs.getBytes("aqda", aqDayAvg, sizeof(aqDayAvg));
+  if (prefs.getBytesLength("aqdp") == sizeof(aqDayPeak)) prefs.getBytes("aqdp", aqDayPeak, sizeof(aqDayPeak));
+  aqDayStoredBucket = prefs.getUInt("aqdb", 0);
+  aqDayStoredIdx = prefs.getUShort("aqdi", 0);
+  // Left unusable (aqDayHasData still false) until the clock says how much time
+  // passed while we were off - see aqDayResume().
+  aqDayPending = aqDayStoredBucket > 0;
+  if (!aqDayPending) aqDayClear(); // untimestamped samples can't be placed; don't let them linger
+}
+
+// Called every loop until it resolves. NTP needs a few seconds after the WiFi
+// association, and history only starts after the 3 minute warm-up anyway.
+void aqDayResume() {
+  if (!aqDayPending) return;
+
+  uint32_t bucket = aqNowSeconds() / AQ_DAY_BUCKET_S;
+  if (!aqClockSynced) {
+    if (millis() > 90000) {
+      aqDayPending = false;
+      aqDayClear();
+      Serial.println("[AQ] no NTP - 24h history restarts from boot and won't be saved");
+    }
+    return;
+  }
+
+  aqDayPending = false;
+  if (bucket < aqDayStoredBucket || bucket - aqDayStoredBucket >= AQ_DAY_SLOTS) {
+    aqDayClear();
+    Serial.println("[AQ] stored 24h history is older than the window, starting fresh");
+    return;
+  }
+
+  aqDayNewestIdx = aqDayStoredIdx % AQ_DAY_SLOTS;
+  aqDayNewestBucket = aqDayStoredBucket;
+  aqDayHasData = true;
+  uint32_t off = bucket - aqDayStoredBucket;
+  aqDayAdvance(off);
+  aqDayNewestBucket = bucket;
+  aqBucketSum = 0; aqBucketN = 0; aqBucketPeak = 0;
+  Serial.printf("[AQ] restored 24h history (%lu min gap while off)\n",
+    (unsigned long)(off * AQ_DAY_BUCKET_S / 60));
 }
 
 void sendUdpPkt(IPAddress ip, bool on, CRGB color, uint8_t bri) {
@@ -697,6 +894,30 @@ input[type=range]::-moz-range-thumb{width:24px;height:24px;border-radius:50%;bac
 .tout-row{display:flex;align-items:center;gap:8px}
 .tout-row input[type=number]{width:90px;padding:10px;border:none;border-radius:8px;background:#1a1a2e;color:#eee;font-size:16px;text-align:center}
 .tout-row span{color:#aaa}
+.aq-panel{background:#1a1a2e;border-radius:8px;padding:10px 12px 8px;margin-bottom:14px;font-size:0.8em}
+.aq-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:9px}
+.aq-head span{color:#888;font-size:0.9em}
+.aq-head b{font-size:1.3em}
+.aq-wrap{position:relative}
+.aq-bar{display:flex;height:10px;border-radius:5px;overflow:hidden;background:#0f0f1e}
+.aq-bar i{height:100%;transition:width .3s}
+.aq-mark{position:absolute;top:-3px;width:3px;height:16px;background:#fff;border-radius:2px;box-shadow:0 0 5px rgba(0,0,0,.9);transition:left .4s}
+.aq-scale{position:relative;height:13px;margin-top:5px;color:#777;font-size:0.8em}
+.aq-scale i{position:absolute;transform:translateX(-50%);font-style:normal;white-space:nowrap}
+.aq-meta{margin-top:7px;color:#888;display:flex;justify-content:space-between;gap:8px}
+.aq-meta b{color:#ccc;font-weight:600}
+.aq-thr{display:flex;gap:8px}
+.aq-thr div{flex:1;display:flex;flex-direction:column;gap:4px}
+.aq-thr small{font-size:0.75em}
+.aq-thr input[type=number]{width:100%;padding:9px 4px;border:none;border-radius:8px;background:#1a1a2e;color:#eee;font-size:16px;text-align:center}
+.aq-hint{margin-top:7px;color:#777;font-size:0.75em;line-height:1.45}
+.aq-gbtn{width:100%;margin-top:9px;padding:9px;border:none;border-radius:8px;background:#0f3460;color:#cfd8e3;font-size:1em;cursor:pointer;transition:.2s}
+.aq-gbtn.open{background:#e94560;color:#fff}
+.aq-graph{margin-top:9px}
+.aq-graph svg{width:100%;height:auto;display:block;touch-action:pan-y}
+.aq-gread{display:flex;justify-content:space-between;gap:8px;color:#888;min-height:15px;margin-bottom:3px}
+.aq-gread b{color:#ddd;font-weight:600}
+.aq-gempty{color:#777;text-align:center;padding:18px 4px;line-height:1.5}
 </style>
 </head>
 <body>
@@ -710,7 +931,20 @@ input[type=range]::-moz-range-thumb{width:24px;height:24px;border-radius:50%;bac
 <div><span>Temp</span><b id="sTemp">--.-</b></div>
 <div><span>Humidity</span><b id="sHum">--.-</b></div>
 <div><span>Sound</span><b id="sSound">--</b></div>
-<div><span>Air Quality</span><b id="sAq">--</b></div>
+</div>
+<div class="aq-panel">
+<div class="aq-head"><span>Air Quality</span><b id="sAq">--</b></div>
+<div class="aq-wrap">
+<div class="aq-bar"><i id="aqSg" style="background:#2ecc71"></i><i id="aqSm" style="background:#f1c40f"></i><i id="aqSp" style="background:#e67e22"></i><i id="aqSh" style="background:#e74c3c"></i></div>
+<div class="aq-mark" id="aqMark" style="left:0"></div>
+</div>
+<div class="aq-scale" id="aqScale"></div>
+<div class="aq-meta"><span id="aqMetaL">--</span><span id="aqMetaR"></span></div>
+<button class="aq-gbtn" id="aqGBtn" onclick="toggleAqGraph()">Show 24 h graph</button>
+<div class="aq-graph" id="aqGraph" style="display:none">
+<div class="aq-gread"><span id="aqGrL">&nbsp;</span><span id="aqGrR"></span></div>
+<div id="aqGBody"></div>
+</div>
 </div>
 <div class="mode-btns">
 <button class="btn-off" id="bOff" onclick="setMode('off')">Off</button>
@@ -758,6 +992,15 @@ input[type=range]::-moz-range-thumb{width:24px;height:24px;border-radius:50%;bac
 <span>°C</span>
 </div>
 </div>
+<div class="ctrl">
+<label>Air quality alert levels (raw sensor value)</label>
+<div class="aq-thr">
+<div><small class="aq-moderate">Moderate</small><input type="number" id="aqmIn" min="1" max="4093" onchange="setAqThr()"></div>
+<div><small class="aq-poor">Poor</small><input type="number" id="aqpIn" min="2" max="4094" onchange="setAqThr()"></div>
+<div><small class="aq-hazardous">Hazardous</small><input type="number" id="aqhIn" min="3" max="4095" onchange="setAqThr()"></div>
+</div>
+<div class="aq-hint">The notification fires at <b>Poor</b> and repeats every 30 min. Raise these if you get alerts on air that feels fine &mdash; the sensor's baseline drifts, so compare against the live raw value above.</div>
+</div>
 </div>
 <script>
 let toutTimer,colTimer;
@@ -779,6 +1022,139 @@ function setBright(v){document.getElementById('bVal').textContent=v;clearTimeout
 function setTout(v){fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeout:v})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
 function setToff(v){fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({toff:v})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
 function setFx(n){fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({musicFx:n})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
+function setAqThr(){const b={aqm:+document.getElementById('aqmIn').value,aqp:+document.getElementById('aqpIn').value,aqh:+document.getElementById('aqhIn').value}
+fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
+
+// The bar spans 0..top, where top leaves one "poor"-width of headroom above the
+// hazardous line so the worst band stays visible instead of being a hairline.
+function renderAq(d){
+const top=Math.max(d.aqh+(d.aqh-d.aqp),1),pc=v=>Math.max(0,Math.min(100,v*100/top))
+document.getElementById('aqSg').style.width=pc(d.aqm)+'%'
+document.getElementById('aqSm').style.width=pc(d.aqp-d.aqm)+'%'
+document.getElementById('aqSp').style.width=pc(d.aqh-d.aqp)+'%'
+document.getElementById('aqSh').style.width=pc(top-d.aqh)+'%'
+document.getElementById('aqMark').style.left=pc(d.aq)+'%'
+const sc=document.getElementById('aqScale')
+sc.innerHTML=[d.aqm,d.aqp,d.aqh].map(v=>'<i style="left:'+pc(v)+'%">'+v+'</i>').join('')
+const aq=document.getElementById('sAq')
+aq.textContent=d.aqReady?d.aqLabel:'Warming up'
+aq.className=d.aqReady?('aq-'+d.aqLabel.toLowerCase()):''
+let left='raw <b>'+d.aq+'</b>'
+if(typeof d.aqV!=='undefined')left+=' &middot; '+d.aqV.toFixed(2)+'V'
+document.getElementById('aqMetaL').innerHTML=left
+let right=''
+if(!d.aqReady){right='warm-up '+d.aqWarm+'s'}
+else if(typeof d.aqTrend==='undefined'){right='trend: collecting'}
+else if(d.aqTrend>2){right='&uarr; worsening +'+d.aqTrend+' / '+d.aqTrendMin+' min'}
+else if(d.aqTrend<-2){right='&darr; clearing '+d.aqTrend+' / '+d.aqTrendMin+' min'}
+else{right='steady over '+d.aqTrendMin+' min'}
+document.getElementById('aqMetaR').innerHTML=right
+if(document.activeElement!==document.getElementById('aqmIn'))document.getElementById('aqmIn').value=d.aqm
+if(document.activeElement!==document.getElementById('aqpIn'))document.getElementById('aqpIn').value=d.aqp
+if(document.activeElement!==document.getElementById('aqhIn'))document.getElementById('aqhIn').value=d.aqh
+}
+
+// --- 24h air quality graph ---
+// One point per 5-minute bucket, straight from the ESP32's ring buffer: the line
+// is the bucket's mean, the band above it the bucket's peak, so a short spike
+// stays visible instead of being averaged flat. Empty slots (-1) are breaks in
+// the line, never zeros - the node was off or the sensor was warming up.
+const GW=320,GH=134,GL=30,GR=6,GT=7,GB=26,GC='#4aa3df'
+let aqGOpen=false,aqGTimer=null
+
+function toggleAqGraph(){
+aqGOpen=!aqGOpen
+document.getElementById('aqGraph').style.display=aqGOpen?'':'none'
+const b=document.getElementById('aqGBtn')
+b.classList.toggle('open',aqGOpen)
+b.textContent=aqGOpen?'Hide 24 h graph':'Show 24 h graph'
+clearInterval(aqGTimer)
+// A bucket is 5 min wide, so re-fetching this ~3KB payload faster buys nothing.
+if(aqGOpen){loadAqGraph();aqGTimer=setInterval(loadAqGraph,60000)}
+}
+function loadAqGraph(){fetch('/api/aqhistory').then(r=>r.json()).then(drawAqGraph).catch(()=>{})}
+
+// The device sends UTC; format in the phone's own timezone. With no NTP it sends
+// clock:false and a monotonic timeline, which only supports relative labels.
+function aqTimeLabel(d,i){
+const t=d.t0+i*d.iv
+if(d.clock){const x=new Date(t*1000);return('0'+x.getHours()).slice(-2)+':'+('0'+x.getMinutes()).slice(-2)}
+const mins=Math.round((d.now-t)/60)
+if(mins<3)return'now'
+return mins<60?'-'+mins+'m':'-'+Math.round(mins/60)+'h'
+}
+function aqBand(d,v){return v<d.aqm?'Good':v<d.aqp?'Moderate':v<d.aqh?'Poor':'Hazardous'}
+
+function drawAqGraph(d){
+const body=document.getElementById('aqGBody'),rl=document.getElementById('aqGrL'),rr=document.getElementById('aqGrR')
+const n=d.avg.length,have=[]
+for(let i=0;i<n;i++)if(d.avg[i]>=0)have.push(i)
+if(!have.length){
+body.innerHTML='<div class="aq-gempty">'+(d.warm?'No samples yet &mdash; the first point lands within '+(d.iv/60)+' min.':'Sensor is still warming up.<br>History starts once it is ready.')+'</div>'
+rl.innerHTML='&nbsp;';rr.innerHTML=''
+return}
+
+// Truncated y-axis (the readings sit well above 0 and the interesting range is
+// narrow), but the Moderate line is always kept in view and the floor is
+// labelled, so "how close is this to an alert" stays readable.
+let lo=d.aqm,hi=d.aqm
+const pk=i=>d.peak[i]<0?d.avg[i]:Math.max(d.peak[i],d.avg[i])
+have.forEach(i=>{lo=Math.min(lo,d.avg[i]);hi=Math.max(hi,pk(i))})
+const pad=Math.max(6,(hi-lo)*0.12);lo=Math.max(0,lo-pad);hi=hi+pad
+const X=i=>GL+(GW-GL-GR)*(n<2?0:i/(n-1)),Y=v=>GT+(GH-GT-GB)*(1-(v-lo)/(hi-lo||1))
+
+let s=''
+const band=(a,b,c)=>{const t=Math.min(b,hi),u=Math.max(a,lo);return t<=u?'':'<rect x="'+GL+'" y="'+Y(t).toFixed(1)+'" width="'+(GW-GL-GR)+'" height="'+(Y(u)-Y(t)).toFixed(1)+'" fill="'+c+'" opacity="0.1"/>'}
+s+=band(0,d.aqm,'#2ecc71')+band(d.aqm,d.aqp,'#f1c40f')+band(d.aqp,d.aqh,'#e67e22')+band(d.aqh,99999,'#e74c3c')
+
+const thr=[[d.aqm,'#f1c40f'],[d.aqp,'#e67e22'],[d.aqh,'#e74c3c']]
+thr.forEach(t=>{if(t[0]<lo||t[0]>hi)return
+s+='<line x1="'+GL+'" y1="'+Y(t[0]).toFixed(1)+'" x2="'+(GW-GR)+'" y2="'+Y(t[0]).toFixed(1)+'" stroke="'+t[1]+'" stroke-width="0.6" stroke-dasharray="3 3" opacity="0.8"/>'
+s+='<text x="'+(GL-4)+'" y="'+(Y(t[0])+2.5).toFixed(1)+'" text-anchor="end" font-size="7.5" fill="'+t[1]+'">'+t[0]+'</text>'})
+s+='<text x="'+(GL-4)+'" y="'+(GH-GB+2.5)+'" text-anchor="end" font-size="7.5" fill="#666">'+Math.round(lo)+'</text>'
+
+const ticks=[0,Math.round((n-1)/4),Math.round((n-1)/2),Math.round(3*(n-1)/4),n-1]
+ticks.forEach((i,k)=>{const x=X(i).toFixed(1)
+s+='<line x1="'+x+'" y1="'+GT+'" x2="'+x+'" y2="'+(GH-GB)+'" stroke="#fff" stroke-width="0.4" opacity="0.07"/>'
+s+='<text x="'+x+'" y="'+(GH-GB+11)+'" text-anchor="'+(k===0?'start':k===4?'end':'middle')+'" font-size="7.5" fill="#777">'+aqTimeLabel(d,i)+'</text>'})
+
+let segs=[],cur=[]
+for(let i=0;i<n;i++){if(d.avg[i]<0){if(cur.length)segs.push(cur);cur=[]}else cur.push(i)}
+if(cur.length)segs.push(cur)
+segs.forEach(g=>{
+if(g.length<2){s+='<circle cx="'+X(g[0]).toFixed(1)+'" cy="'+Y(d.avg[g[0]]).toFixed(1)+'" r="1.8" fill="'+GC+'"/>';return}
+const up=g.map(i=>X(i).toFixed(1)+' '+Y(pk(i)).toFixed(1)).join(' L')
+const dn=g.slice().reverse().map(i=>X(i).toFixed(1)+' '+Y(d.avg[i]).toFixed(1)).join(' L')
+s+='<path d="M'+up+' L'+dn+' Z" fill="'+GC+'" opacity="0.25"/>'
+s+='<polyline points="'+g.map(i=>X(i).toFixed(1)+','+Y(d.avg[i]).toFixed(1)).join(' ')+'" fill="none" stroke="'+GC+'" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>'})
+
+s+='<line id="aqX" x1="0" y1="'+GT+'" x2="0" y2="'+(GH-GB)+'" stroke="#fff" stroke-width="0.6" opacity="0"/>'
+s+='<circle id="aqD" cx="0" cy="0" r="2.4" fill="#fff" stroke="#16213e" stroke-width="0.8" opacity="0"/>'
+s+='<rect id="aqH" x="'+GL+'" y="'+GT+'" width="'+(GW-GL-GR)+'" height="'+(GH-GT-GB)+'" fill="transparent"/>'
+body.innerHTML='<svg viewBox="0 0 '+GW+' '+GH+'">'+s+'</svg>'
+
+let mn=9999,mx=0,sum=0
+have.forEach(i=>{sum+=d.avg[i];mn=Math.min(mn,d.avg[i]);mx=Math.max(mx,pk(i))})
+const cov=have.length*d.iv/60
+const sumL='24 h &middot; low <b>'+mn+'</b> avg <b>'+Math.round(sum/have.length)+'</b> peak <b>'+mx+'</b>'
+const sumR=(cov>=60?(cov/60).toFixed(1)+' h':Math.round(cov)+' min')+' of data'
+const svg=body.firstChild,cx=svg.querySelector('#aqX'),dot=svg.querySelector('#aqD')
+const rest=()=>{cx.setAttribute('opacity','0');dot.setAttribute('opacity','0');rl.innerHTML=sumL;rr.innerHTML=sumR}
+// Scrub: snap to the nearest bucket that actually holds a sample, so dragging
+// across a gap reads the real neighbour instead of going blank.
+const at=e=>{
+const r=svg.getBoundingClientRect(),i=Math.round(((e.clientX-r.left)/r.width*GW-GL)/((GW-GL-GR)/(n-1)))
+let j=have[0]
+have.forEach(k=>{if(Math.abs(k-i)<Math.abs(j-i))j=k})
+cx.setAttribute('x1',X(j));cx.setAttribute('x2',X(j));cx.setAttribute('opacity','0.5')
+dot.setAttribute('cx',X(j));dot.setAttribute('cy',Y(d.avg[j]));dot.setAttribute('opacity','1')
+rl.innerHTML=aqTimeLabel(d,j)+' &middot; avg <b>'+d.avg[j]+'</b>'+(pk(j)>d.avg[j]?' peak <b>'+pk(j)+'</b>':'')
+rr.innerHTML='<span class="aq-'+aqBand(d,d.avg[j]).toLowerCase()+'">'+aqBand(d,d.avg[j])+'</span>'}
+svg.querySelector('#aqH').addEventListener('pointermove',at)
+svg.querySelector('#aqH').addEventListener('pointerdown',at)
+svg.addEventListener('pointerleave',rest)
+rest()
+}
 
 let stripOn=[]
 function renderStrips(list){
@@ -816,11 +1192,7 @@ document.getElementById('sMotion').textContent=d.motion?'Yes':'No'
 if(typeof d.temp!=='undefined')document.getElementById('sTemp').textContent=d.temp.toFixed(1)
 if(typeof d.hum!=='undefined')document.getElementById('sHum').textContent=d.hum.toFixed(1)
 if(typeof d.soundLevel!=='undefined')document.getElementById('sSound').textContent=d.soundLevel
-if(typeof d.aqPercent!=='undefined'){
-const aq=document.getElementById('sAq')
-aq.textContent=(d.aqReady?d.aqLabel:'Warming up')+' ('+d.aqPercent+'%)'
-aq.className=d.aqReady?('aq-'+d.aqLabel.toLowerCase()):''
-}
+if(typeof d.aq!=='undefined')renderAq(d)
 // The colour/brightness controls show whichever strip is being edited; "All"
 // falls back to the top-level values (which mirror strip 0).
 const sel=(selStrip>=0&&d.strips&&d.strips[selStrip])?{c:d.strips[selStrip].c,b:d.strips[selStrip].b}:{c:d.color,b:d.brightness}
@@ -871,9 +1243,21 @@ void handleStatus() {
   doc["soundLevel"] = soundLevel;
   doc["musicFx"] = musicFx;
   doc["aq"] = mq135Raw;
+  doc["aqV"] = mq135Voltage;
   doc["aqPercent"] = airQualityPercent(mq135Raw);
   doc["aqLabel"] = airQualityLabel(mq135Raw);
   doc["aqReady"] = mq135Ready;
+  doc["aqWarm"] = mq135Ready ? 0 : (MQ135_WARMUP_MS - (millis() - mq135WarmupStart)) / 1000;
+  doc["aqm"] = aqThreshModerate;
+  doc["aqp"] = aqThreshPoor;
+  doc["aqh"] = aqThreshHazardous;
+  // Trend vs the oldest sample we have; aqTrendMin says how far back that is, so
+  // the UI can say "over 4 min" instead of implying a full 10 minutes of history.
+  if (aqHistCount > 1) {
+    int oldest = aqHist[aqHistCount < AQ_HIST_SLOTS ? 0 : aqHistIdx];
+    doc["aqTrend"] = mq135Raw - oldest;
+    doc["aqTrendMin"] = aqHistCount - 1;
+  }
   doc["rssi"] = WiFi.RSSI(); // weak signal here shows up as flaky OTA long before anything else breaks
 
   // Top-level color/brightness mirror strip 0 - kept so anything written
@@ -902,6 +1286,54 @@ void handleStatus() {
   String response;
   serializeJson(doc, response);
   server.send(200, "application/json", response);
+}
+
+// Data for the 24h graph. Sent oldest-first with an explicit start time and
+// bucket width so the browser can put times on the x-axis itself; -1 slots are
+// gaps (node off, or sensor warming up) and must be drawn as breaks rather than
+// interpolated across. Hand-built rather than via ArduinoJson - 576 numbers in a
+// StaticJsonDocument would want more RAM than the whole ring buffer.
+void handleAqHistory() {
+  uint32_t nowS = aqNowSeconds();
+
+  String out;
+  out.reserve(4300);
+  out = "{\"iv\":";
+  out += AQ_DAY_BUCKET_S;
+  out += ",\"now\":";   out += nowS;
+  out += ",\"clock\":"; out += aqClockSynced ? "true" : "false";
+  out += ",\"warm\":";  out += mq135Ready ? "true" : "false";
+  out += ",\"aqm\":";   out += aqThreshModerate;
+  out += ",\"aqp\":";   out += aqThreshPoor;
+  out += ",\"aqh\":";   out += aqThreshHazardous;
+
+  if (!aqDayHasData) {
+    out += ",\"t0\":"; out += nowS;
+    out += ",\"avg\":[],\"peak\":[]}";
+    server.send(200, "application/json", out);
+    return;
+  }
+
+  // Slot 0 of the response is the oldest bucket in the window. Signed: on the
+  // millis() fallback the window can start "before" the epoch, which is
+  // meaningless but harmless since the UI then labels relative times anyway.
+  long t0 = ((long)aqDayNewestBucket - (AQ_DAY_SLOTS - 1)) * AQ_DAY_BUCKET_S;
+  out += ",\"t0\":"; out += t0;
+
+  uint16_t oldest = (aqDayNewestIdx + 1) % AQ_DAY_SLOTS;
+  out += ",\"avg\":[";
+  for (int i = 0; i < AQ_DAY_SLOTS; i++) {
+    if (i) out += ',';
+    out += aqDayAvg[(oldest + i) % AQ_DAY_SLOTS];
+  }
+  out += "],\"peak\":[";
+  for (int i = 0; i < AQ_DAY_SLOTS; i++) {
+    if (i) out += ',';
+    out += aqDayPeak[(oldest + i) % AQ_DAY_SLOTS];
+  }
+  out += "]}";
+
+  server.send(200, "application/json", out);
 }
 
 void handleSetMode() {
@@ -958,7 +1390,7 @@ void handleSetLed() {
 void handleSetSettings() {
   if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"success\":false}"); return; }
 
-  StaticJsonDocument<128> doc;
+  StaticJsonDocument<256> doc;
   if (deserializeJson(doc, server.arg("plain"))) { server.send(400, "application/json", "{\"success\":false}"); return; }
 
   if (doc.containsKey("timeout")) {
@@ -969,6 +1401,18 @@ void handleSetSettings() {
   }
   if (doc.containsKey("musicFx")) {
     musicFx = constrain((int)doc["musicFx"], 0, 2);
+  }
+  bool aqChanged = false;
+  if (doc.containsKey("aqm")) { aqThreshModerate = doc["aqm"]; aqChanged = true; }
+  if (doc.containsKey("aqp")) { aqThreshPoor = doc["aqp"]; aqChanged = true; }
+  if (doc.containsKey("aqh")) { aqThreshHazardous = doc["aqh"]; aqChanged = true; }
+  if (aqChanged) {
+    sanitizeAqThresholds();
+    // Raising the bar past the current reading should clear a standing alert
+    // rather than leave it latched until the air happens to improve.
+    if (aqAlertActive && mq135Raw < aqThreshModerate) aqAlertActive = false;
+    Serial.printf("[MQ135] thresholds now moderate>=%d poor>=%d hazardous>=%d (raw=%d)\n",
+      aqThreshModerate, aqThreshPoor, aqThreshHazardous, mq135Raw);
   }
   markSettingsDirty();
 
@@ -1009,6 +1453,7 @@ volatile bool otaActive = false; // set in ArduinoOTA.onStart, see loop()
 void setupServer() {
   server.on("/", handleRoot);
   server.on("/api/status", handleStatus);
+  server.on("/api/aqhistory", handleAqHistory);
   server.on("/api/mode", HTTP_POST, handleSetMode);
   server.on("/api/led", HTTP_POST, handleSetLed);
   server.on("/api/settings", HTTP_POST, handleSetSettings);
@@ -1041,6 +1486,10 @@ void startWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("Connected, IP: ");
     Serial.println(WiFi.localIP());
+    // UTC, no timezone offset: the browser formats the 24h graph's x-axis in
+    // its own zone, so the node never has to know about DST. This is also what
+    // makes the history survive a reboot - see aqDayResume().
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   } else {
     Serial.println("WiFi failed, will retry in loop");
   }
@@ -1070,6 +1519,8 @@ void processSerialCommands() {
         Serial.println("  status     - Show all status");
         Serial.println("  mic        - Read MAX9814 mic level");
         Serial.println("  aq         - Read MQ135 air quality sensor");
+        Serial.println("  aqset a b c- Set moderate/poor/hazardous thresholds");
+        Serial.println("  aqday      - Summarize the 24h history behind the web graph");
         Serial.println("  testnotify - Send a test ntfy.sh notification");
         Serial.println("=================================\n");
       } else if (cmdBuffer == "sensor" || cmdBuffer == "s") {
@@ -1123,8 +1574,8 @@ void processSerialCommands() {
         Serial.printf("Temp: %.1f C, Humidity: %.1f %%\n", currentTemperature, currentHumidity);
         Serial.printf("Sound level: %d/255 (p2p=%d, bass=%.2f treb=%.2f, ceiling=%.0f)\n",
           soundLevel, soundPeakToPeak, bassEnv, trebEnv, envMax);
-        Serial.printf("Air quality: raw=%d volt=%.2fV %d%% [%s] %s\n", mq135Raw, mq135Voltage,
-          airQualityPercent(mq135Raw), airQualityLabel(mq135Raw), mq135Ready ? "" : "(warming up)");
+        Serial.printf("Air quality: raw=%d volt=%.2fV [%s] %s\n", mq135Raw, mq135Voltage,
+          airQualityLabel(mq135Raw), mq135Ready ? "" : "(warming up)");
       } else if (cmdBuffer == "mic") {
         Serial.printf("Mic level: %d/255  peak-to-peak=%d  auto-gain ceiling=%.0f\n", soundLevel, soundPeakToPeak, envMax);
         Serial.printf("Envelopes: bass=%.2f treble=%.2f total=%.2f | beatPulse=%.2f lastBeat=%lums ago\n",
@@ -1132,12 +1583,54 @@ void processSerialCommands() {
         Serial.printf("Music effect: %d (0=Pulse 1=Waves 2=Spectrum)\n", musicFx);
         Serial.println("Make noise near the mic and run this again - level/peak-to-peak should rise.");
       } else if (cmdBuffer == "aq" || cmdBuffer == "air") {
-        Serial.printf("MQ135 raw=%d  voltage=%.2fV  index=%d%%  [%s]\n", mq135Raw, mq135Voltage,
+        Serial.printf("MQ135 raw=%d  voltage=%.2fV  scale=%d%%  [%s]\n", mq135Raw, mq135Voltage,
           airQualityPercent(mq135Raw), airQualityLabel(mq135Raw));
         if (!mq135Ready) {
           Serial.printf("Still warming up (%lu s remaining)\n", (MQ135_WARMUP_MS - (millis() - mq135WarmupStart)) / 1000);
         }
-        Serial.printf("Thresholds (raw): moderate>=%d poor>=%d hazardous>=%d\n", AQ_THRESHOLD_MODERATE, AQ_THRESHOLD_POOR, AQ_THRESHOLD_HAZARDOUS);
+        Serial.printf("Thresholds (raw): moderate>=%d poor>=%d hazardous>=%d  [alert fires at %d]\n",
+          aqThreshModerate, aqThreshPoor, aqThreshHazardous, aqThreshPoor);
+        if (aqHistCount > 1) {
+          int oldest = aqHist[aqHistCount < AQ_HIST_SLOTS ? 0 : aqHistIdx];
+          Serial.printf("Trend: %+d over the last %d min\n", mq135Raw - oldest, aqHistCount - 1);
+        } else {
+          Serial.println("Trend: collecting (one sample per minute)");
+        }
+        Serial.println("Change them with: aqset <moderate> <poor> <hazardous>");
+      } else if (cmdBuffer.startsWith("aqset")) {
+        int m1, p1, h1;
+        if (sscanf(cmdBuffer.c_str(), "aqset %d %d %d", &m1, &p1, &h1) == 3) {
+          aqThreshModerate = m1; aqThreshPoor = p1; aqThreshHazardous = h1;
+          sanitizeAqThresholds();
+          if (aqAlertActive && mq135Raw < aqThreshModerate) aqAlertActive = false;
+          markSettingsDirty();
+          Serial.printf("Thresholds set: moderate>=%d poor>=%d hazardous>=%d (raw now %d -> %s)\n",
+            aqThreshModerate, aqThreshPoor, aqThreshHazardous, mq135Raw, airQualityLabel(mq135Raw));
+        } else {
+          Serial.println("Usage: aqset <moderate> <poor> <hazardous>   e.g. aqset 130 155 195");
+        }
+      } else if (cmdBuffer == "aqday") {
+        int filled = 0, mn = 4095, mx = 0;
+        long sum = 0;
+        for (int i = 0; i < AQ_DAY_SLOTS; i++) {
+          if (aqDayAvg[i] < 0) continue;
+          filled++;
+          sum += aqDayAvg[i];
+          if (aqDayAvg[i] < mn) mn = aqDayAvg[i];
+          if (aqDayPeak[i] > mx) mx = aqDayPeak[i];
+        }
+        if (!filled) {
+          Serial.printf("24h history: empty (%s)\n",
+            aqDayPending ? "restored from NVS, waiting on the clock" :
+            (mq135Ready ? "nothing recorded yet" : "sensor still warming up"));
+        } else {
+          Serial.printf("24h history: %d/%d buckets = %d min of data | min=%d avg=%ld peak=%d\n",
+            filled, AQ_DAY_SLOTS, filled * (AQ_DAY_BUCKET_S / 60), mn, sum / filled, mx);
+        }
+        Serial.printf("Bucket %lu s, clock %s, saved every %lu min\n",
+          (unsigned long)AQ_DAY_BUCKET_S,
+          aqClockSynced ? "NTP synced (history persists)" : "not synced (relative timeline, not saved)",
+          AQ_DAY_SAVE_INTERVAL / 60000UL);
       } else if (cmdBuffer == "testnotify") {
         Serial.println("Sending test notification via ntfy.sh...");
         sendNtfyNotification("Test Notification", "This is a test alert from your ESP32.", "default", "bell");
@@ -1170,6 +1663,7 @@ void setup() {
   Serial.println();
 
   loadSettings(); // before setupPins so the restored brightness is applied
+  aqDayLoad();    // needs prefs open, which loadSettings() does
   setupPins();
   // Without this, "millis() - 0 < timeout" counts boot as recent motion and
   // AUTO mode lights the strip for the first timeout period after every reboot.
@@ -1197,6 +1691,9 @@ void setup() {
     otaActive = true;
     FastLED.clear();
     FastLED.show();
+    // Last chance to keep the 24h history across the reboot this update ends
+    // in. One ~2.3KB NVS write, tens of ms - nowhere near the 10s chunk budget.
+    aqDaySave();
     Serial.println("OTA: start");
   });
   ArduinoOTA.onEnd([]() { Serial.println("OTA: done"); });
@@ -1273,6 +1770,22 @@ void loop() {
     lastAqRead = m;
     readMQ135();
     checkAirQualityAlert(mq135Raw);
+    if (mq135Ready) aqDayRecord(mq135Raw); // warm-up curve is not air quality
+  }
+
+  aqDayResume(); // no-op once the clock has settled the restored history
+  if (m - lastAqDaySave >= AQ_DAY_SAVE_INTERVAL) {
+    lastAqDaySave = m;
+    aqDaySave();
+  }
+
+  // Only log history once the sensor is warm, otherwise the trend spends the
+  // first 10 minutes after every boot reporting the warm-up curve as "improving".
+  if (mq135Ready && m - lastAqHist >= AQ_HIST_INTERVAL) {
+    lastAqHist = m;
+    aqHist[aqHistIdx] = mq135Raw;
+    aqHistIdx = (aqHistIdx + 1) % AQ_HIST_SLOTS;
+    if (aqHistCount < AQ_HIST_SLOTS) aqHistCount++;
   }
 
   updateLEDs();
