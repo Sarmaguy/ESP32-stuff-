@@ -7,6 +7,7 @@
 #include <ArduinoOTA.h>
 #include "secrets.h"
 #include "led_sync.h"
+#include "node_health.h"
 
 #define LED_PIN    14
 #define NUM_LEDS   122
@@ -20,7 +21,6 @@ bool ledOn = false;
 CRGB targetColor = CRGB::White;
 uint8_t brightness = 128;
 
-unsigned long lastWiFiAttempt = 0;
 unsigned long lastHeartbeat = 0;
 unsigned long pktCount = 0;
 bool netReady = false;
@@ -59,6 +59,13 @@ void testLEDs() {
 }
 
 void initServer() {
+  // initNetworking() runs this again after every reconnect, and each server.on()
+  // allocates a new handler, so only the first call registers routes. begin()
+  // is a no-op while the server is already listening.
+  static bool routesAdded = false;
+  if (routesAdded) { server.begin(); return; }
+  routesAdded = true;
+
   server.on("/set", HTTP_POST, []() {
     if (!server.hasArg("plain")) {
       server.send(400, "application/json", "{\"success\":false}");
@@ -87,7 +94,7 @@ void initServer() {
     server.send(200, "text/plain", "pong");
   });
   server.on("/status", []() {
-    StaticJsonDocument<192> doc;
+    StaticJsonDocument<512> doc;
     doc["on"] = ledOn;
     char hex[8];
     snprintf(hex, sizeof(hex), "#%02X%02X%02X", targetColor.r, targetColor.g, targetColor.b);
@@ -96,6 +103,7 @@ void initServer() {
     doc["pkts"] = pktCount;
     doc["rssi"] = WiFi.RSSI();
     doc["uptime"] = millis() / 1000;
+    nodeHealthReport(doc); // boot reason, heap, Wi-Fi drop history
     String r;
     serializeJson(doc, r);
     server.send(200, "application/json", r);
@@ -110,6 +118,12 @@ void startWiFi() {
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
   WiFi.mode(WIFI_STA);
+  // Same reason as the master (see main.cpp startWiFi): modem sleep parks the
+  // radio between DTIM beacons. Measured from the LAN it turned this node's
+  // ping RTT into a 14->127ms sawtooth (73ms average, 1-3% loss) and added the
+  // same jitter to every UDP state push and OTA chunk. Mains-powered, so the
+  // idle current does not matter.
+  WiFi.setSleep(false);
   WiFi.begin(ssid, password);
 
   Serial.print("Connecting to WiFi");
@@ -209,19 +223,30 @@ void setup() {
 
   ArduinoOTA.setHostname("esp32-slave");
   ArduinoOTA.setPassword(otaPassword);
-  ArduinoOTA.onStart([]() { Serial.println("OTA: start"); });
+  // The 1s default aborts the update on the first Wi-Fi stall, and with its
+  // three re-prompts gives up after ~4s - shorter than the dropouts this LAN
+  // has. The master has used 10s for the same reason (see main.cpp setup).
+  ArduinoOTA.setTimeout(10000);
+  ArduinoOTA.onStart([]() {
+    nodeHealthOtaStart();
+    Serial.println("OTA: start");
+  });
   ArduinoOTA.onEnd([]() { Serial.println("OTA: done"); });
   ArduinoOTA.onError([](ota_error_t e) {
+    nodeHealthOtaError();
     Serial.printf("OTA: error %d\n", e);
   });
   ArduinoOTA.begin();
   Serial.println("OTA ready");
+
+  nodeHealthBegin();
 }
 
 void loop() {
   ArduinoOTA.handle();
 
-  if (WiFi.status() == WL_CONNECTED) {
+  // Reconnect, and the reboot if it never comes back, live in node_health.h.
+  if (nodeHealthLoop(ssid, password)) {
     initNetworking();
     if (netReady) {
       server.handleClient();
@@ -229,15 +254,6 @@ void loop() {
     }
   } else {
     netReady = false;
-    unsigned long n = millis();
-    if (n - lastWiFiAttempt > 10000) {
-      lastWiFiAttempt = n;
-      Serial.println("Reconnecting WiFi...");
-      WiFi.mode(WIFI_OFF);
-      delay(100);
-      WiFi.mode(WIFI_STA);
-      WiFi.begin(ssid, password);
-    }
   }
 
   if (millis() - lastHeartbeat >= 5000) {

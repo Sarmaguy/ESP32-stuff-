@@ -10,10 +10,17 @@
 #include <ArduinoOTA.h>
 #include <Preferences.h>
 #include <time.h>
+#include <esp_wifi.h>
+#include <algorithm>
 #include "secrets.h"
 #include "led_sync.h"
+#include "node_health.h"
 
 // HLK-LD2410B OUT pin (open-drain, LOW=no one, HIGH=presence)
+// Its built-in Bluetooth must stay OFF (done 2026-10-29). It sits a few cm from
+// this ESP's antenna, and its 2.4 GHz bursts were destroying full-size Wi-Fi
+// frames: web page and OTA stalled while small packets still got through.
+// See CLAUDE.md "Hardware documentation" for how to turn it off again.
 #define LD2410_PIN  32
 #define LED_PIN     14
 #define NUM_LEDS    100
@@ -34,7 +41,7 @@
 CRGB leds[NUM_LEDS];
 
 bool getLedOn();
-void syncStrips(bool force);
+void syncStrips(bool force, bool includeHttp = false);
 uint8_t musicBriFor(int strip);
 void sanitizeAqThresholds();
 
@@ -90,25 +97,36 @@ unsigned long mq135WarmupStart = 0;
 bool mq135Ready = false;
 const unsigned long MQ135_WARMUP_MS = 3UL * 60UL * 1000UL; // sensor needs a few min to stabilize each power-on
 
-// Raw ADC thresholds - MQ135 output isn't linear/calibrated to real ppm without a
-// proper burn-in + clean-air baseline, so this classifies on the raw reading.
+// Levels are set RELATIVE to this room's own clean-air baseline, not as raw ADC
+// values. The MQ135 is uncalibrated and its baseline drifts with temperature,
+// humidity and age far more than any useful threshold is wide: ~60 on
+// 2026-07-26, ~110-140 mid-October, 206-541 (median 321) by 2026-10-29. Every
+// fixed threshold went stale within days - the last set (220/221/290) sat below
+// the median and fired all day.
 //
-// These are RUNTIME settings (NVS-backed, editable from the web UI and the "aqset"
-// serial command), not constants, because the sensor's baseline drifts: it moved
-// from ~55-66 on 2026-07-26 to a steady ~111 on 2026-07-27 in a room that smelled
-// fine, which made the old 90/115/160 fire alerts on ordinary air. Retune against
-// the live raw value on the page rather than reflashing.
-//
-// Defaults below assume a fresh-air floor near ~105 and keep the deltas the
-// 2026-07-26 calibration implied (moderate ~+30, poor ~+55, hazardous ~+100 over
-// baseline; breathing straight onto the sensor was ~+60).
-#define AQ_DEFAULT_MODERATE  130
-#define AQ_DEFAULT_POOR      155
-#define AQ_DEFAULT_HAZARDOUS 195
+// So the baseline is learned: the 10th percentile of the 5-minute averages in
+// the 24h history (aqDayAvg), recomputed every minute - "the cleanest the air
+// got today". The three levels are percentages above it (NVS, editable from the
+// web UI and "aqset"). Percent rather than fixed offsets because the response
+// scales with the baseline: +55 was big at a baseline of 60, small at 230.
+#define AQ_DEFAULT_PCT_MODERATE  30
+#define AQ_DEFAULT_PCT_POOR      60
+#define AQ_DEFAULT_PCT_HAZARDOUS 100
+#define AQ_BASE_PERCENTILE       10
+#define AQ_BASE_MIN_BUCKETS      24 // 2h of history before alerts trust the baseline
 
-int aqThreshModerate  = AQ_DEFAULT_MODERATE;
-int aqThreshPoor      = AQ_DEFAULT_POOR;
-int aqThreshHazardous = AQ_DEFAULT_HAZARDOUS;
+int aqPctModerate  = AQ_DEFAULT_PCT_MODERATE;
+int aqPctPoor      = AQ_DEFAULT_PCT_POOR;
+int aqPctHazardous = AQ_DEFAULT_PCT_HAZARDOUS;
+int aqBaseline = 0;        // learned clean-air level (raw); 0 = nothing to learn from yet
+bool aqBaseTrusted = false; // enough history for alerts (AQ_BASE_MIN_BUCKETS)
+float aqSmooth = 0;        // ~1 min EMA of the raw reading; alerts decide on this, not single samples
+
+// Effective raw levels = baseline * (1 + pct/100), recomputed with the baseline.
+// Everything that classifies (label, bar, graph bands) reads these.
+int aqThreshModerate  = 0;
+int aqThreshPoor      = 0;
+int aqThreshHazardous = 0;
 
 // ~10 minutes of history (one slot per minute) so the UI can say whether the air
 // is getting better or worse, which a single instantaneous number never shows.
@@ -151,9 +169,24 @@ unsigned long lastAqDaySave = 0;
 // loses at most this much history (OTA flushes on its way out, see onStart).
 const unsigned long AQ_DAY_SAVE_INTERVAL = 30UL * 60UL * 1000UL;
 
-bool aqAlertActive = false;
+// Alerting works in episodes so one stretch of bad air is one notification, not
+// one per sample or per 30 minutes (the old behaviour, which with the stale
+// thresholds above meant ~48 alerts a day). An episode starts after Poor has
+// held for AQ_ALERT_HOLD_MS, may escalate once to Hazardous, reminds every
+// AQ_ALERT_REMIND_MS while still Poor, and only ends after AQ_CLEAR_HOLD_MS below
+// Moderate - so it can't flap. A new one can't alert within AQ_ALERT_COOLDOWN_MS
+// of the last ending.
+const unsigned long AQ_ALERT_HOLD_MS     = 5UL * 60UL * 1000UL;
+const unsigned long AQ_CLEAR_HOLD_MS     = 10UL * 60UL * 1000UL;
+const unsigned long AQ_ALERT_REMIND_MS   = 3UL * 60UL * 60UL * 1000UL;
+const unsigned long AQ_ALERT_COOLDOWN_MS = 60UL * 60UL * 1000UL;
+bool aqAlertActive = false;        // inside an alerted episode
+bool aqEpisodeHazSent = false;
+unsigned long aqPoorSince = 0;     // smoothed >= Poor since (0 = not)
+unsigned long aqHazSince = 0;      // smoothed >= Hazardous since, within an episode
+unsigned long aqClearSince = 0;    // smoothed < Moderate since, within an episode
 unsigned long lastAqAlertSent = 0;
-const unsigned long AQ_ALERT_REPEAT_MS = 30UL * 60UL * 1000UL; // re-remind every 30 min while still poor
+unsigned long lastAqEpisodeEnd = 0;
 
 // --- Slave configuration ---
 // Leave an entry as "" if that slave doesn't exist yet - blank slots are
@@ -209,6 +242,29 @@ bool settingsDirty = false;
 unsigned long lastSettingsChange = 0;
 const unsigned long SETTINGS_SAVE_DEBOUNCE_MS = 3000; // batch rapid slider drags into one flash write
 
+// --- Daily schedule ---
+// Every day from this local hour the mode goes back to AUTO, so a manual
+// ON/OFF/music choice made during the day doesn't carry into the evening.
+#define AUTO_MODE_HOUR 17
+// Local time exists for this schedule only - the 24h graph stays on UTC epoch
+// seconds and the browser localizes it. POSIX rule for Europe/Zagreb, so the
+// CET/CEST switch is handled without anyone touching it.
+#define LOCAL_TZ "CET-1CEST,M3.5.0,M10.5.0/3"
+uint32_t lastAutoDay = 0; // local yyyymmdd the reset last ran (NVS "autod")
+
+// --- Wi-Fi link knobs (POST /api/wifi), runtime only ---
+// Defaults match startWiFi(). Added 2026-10-27 to chase full-size frames being
+// lost on this node while small ones get through (see CLAUDE.md).
+bool wifiSleepOn = false;
+uint8_t wifiProto = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N;
+unsigned long wifiRejoinAt = 0; // millis() to re-associate after a protocol change; 0 = none
+
+const char* wifiProtoName(uint8_t p) {
+  if (p == WIFI_PROTOCOL_11B) return "b";
+  if (p == (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G)) return "bg";
+  return "bgn";
+}
+
 void setupPins() {
   pinMode(LD2410_PIN, INPUT_PULLUP);
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
@@ -231,10 +287,13 @@ void loadSettings() {
   tempOffset = prefs.getFloat("toff", -2.0f);
   musicFx = prefs.getUChar("fx", 0);
   if (musicFx > 2) musicFx = 0;
-  aqThreshModerate  = prefs.getInt("aqm", AQ_DEFAULT_MODERATE);
-  aqThreshPoor      = prefs.getInt("aqp", AQ_DEFAULT_POOR);
-  aqThreshHazardous = prefs.getInt("aqh", AQ_DEFAULT_HAZARDOUS);
+  aqPctModerate  = prefs.getInt("aqmP", AQ_DEFAULT_PCT_MODERATE);
+  aqPctPoor      = prefs.getInt("aqpP", AQ_DEFAULT_PCT_POOR);
+  aqPctHazardous = prefs.getInt("aqhP", AQ_DEFAULT_PCT_HAZARDOUS);
   sanitizeAqThresholds();
+  // Raw-value thresholds from before the learned baseline mean nothing now.
+  for (const char* k : {"aqm", "aqp", "aqh"}) if (prefs.isKey(k)) prefs.remove(k);
+  lastAutoDay = prefs.getUInt("autod", 0);
   uint8_t stripMask = prefs.getUChar("strips", 0xFF); // 0xFF = every strip on
   // Pre-per-strip builds stored one shared "color"/"bri"; fall back to those so
   // an upgrade keeps the look it had instead of snapping every strip to white.
@@ -273,13 +332,46 @@ void persistSettings() {
   prefs.putUInt("tout", motionTimeout);
   prefs.putFloat("toff", tempOffset);
   prefs.putUChar("fx", musicFx);
-  prefs.putInt("aqm", aqThreshModerate);
-  prefs.putInt("aqp", aqThreshPoor);
-  prefs.putInt("aqh", aqThreshHazardous);
+  prefs.putInt("aqmP", aqPctModerate);
+  prefs.putInt("aqpP", aqPctPoor);
+  prefs.putInt("aqhP", aqPctHazardous);
   uint8_t stripMask = 0;
   for (int i = 0; i < NUM_STRIPS; i++) if (stripEnabled[i]) stripMask |= (1 << i);
   prefs.putUChar("strips", stripMask);
   Serial.println("[NVS] settings saved");
+}
+
+// Puts the mode back to AUTO once per local day at AUTO_MODE_HOUR. If the node
+// was off or rebooting right then it catches up when it's back (until
+// midnight), but only once per day, so a mode picked by hand afterwards
+// sticks. The day is saved to NVS so a reboot doesn't fire it a second time.
+void checkDailyAuto() {
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck < 1000) return;
+  lastCheck = millis();
+
+  time_t now = time(nullptr);
+  if (now < 1700000000) return; // no NTP yet, so no idea what the local time is
+  struct tm lt;
+  localtime_r(&now, &lt);
+  uint32_t today = (lt.tm_year + 1900) * 10000UL + (lt.tm_mon + 1) * 100UL + lt.tm_mday;
+
+  if (lastAutoDay == 0) {
+    // Nothing stored (first boot with this feature, or NVS was wiped). Already
+    // past the hour: count today as done rather than override a mode set by
+    // hand. Before it: arm with a non-date so today's run happens normally.
+    lastAutoDay = lt.tm_hour >= AUTO_MODE_HOUR ? today : 1;
+    prefs.putUInt("autod", lastAutoDay);
+  }
+  if (lt.tm_hour < AUTO_MODE_HOUR || today == lastAutoDay) return;
+
+  lastAutoDay = today;
+  prefs.putUInt("autod", today);
+  if (ledMode == AUTO) return;
+
+  ledMode = AUTO;
+  markSettingsDirty();
+  Serial.printf("[SCHED] %02d:%02d local - mode reset to AUTO\n", lt.tm_hour, lt.tm_min);
 }
 
 void readMotionSensor() {
@@ -490,20 +582,30 @@ volatile bool ntfyInFlight = false;
 void ntfyTask(void* param) {
   NtfyMsg* m = (NtfyMsg*)param;
 
-  WiFiClientSecure client;
-  client.setInsecure(); // skip TLS cert validation - acceptable for this hobby use case
-  client.setTimeout(5000);
+  // The braces matter: vTaskDelete(NULL) never returns, so anything still in
+  // scope at that point never has its destructor run. With the client, http and
+  // url declared at function scope, every notification leaked the whole TLS
+  // session (~35KB of mbedTLS buffers) plus a socket - ntfy.sh answers
+  // keep-alive, so http.end() deliberately left it open for reuse. A few alerts
+  // and the heap was too far gone to serve the web page.
+  {
+    WiFiClientSecure client;
+    client.setInsecure(); // skip TLS cert validation - acceptable for this hobby use case
+    client.setTimeout(5000);
 
-  HTTPClient http;
-  http.setConnectTimeout(5000);
-  String url = String("https://ntfy.sh/") + ntfyTopic;
-  if (http.begin(client, url)) {
-    http.addHeader("Title", m->title);
-    http.addHeader("Priority", m->priority);
-    http.addHeader("Tags", m->tags);
-    int code = http.POST(m->message);
-    Serial.printf("[ntfy] POST %s -> %d\n", url.c_str(), code);
-    http.end();
+    HTTPClient http;
+    http.setReuse(false); // one-shot: close on end() rather than hold the session
+    http.setConnectTimeout(5000);
+    String url = String("https://ntfy.sh/") + ntfyTopic;
+    if (http.begin(client, url)) {
+      http.addHeader("Title", m->title);
+      http.addHeader("Priority", m->priority);
+      http.addHeader("Tags", m->tags);
+      int code = http.POST(m->message);
+      Serial.printf("[ntfy] POST %s -> %d (heap %u, largest block %u)\n", url.c_str(), code,
+        ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      http.end();
+    }
   }
 
   delete m;
@@ -545,12 +647,42 @@ const char* airQualityLabel(int raw) {
   return "Hazardous";
 }
 
+// Turns baseline + percentages into the raw levels everything classifies
+// against. With no history at all yet, the smoothed reading stands in as a
+// provisional baseline so the bar and label stay sensible; alerts wait for
+// aqBaseTrusted regardless.
+void aqApplyLevels() {
+  int base = aqBaseline > 0 ? aqBaseline : aqSmooth > 0 ? (int)aqSmooth : mq135Raw > 0 ? mq135Raw : 100;
+  aqThreshModerate  = constrain(base + base * aqPctModerate / 100, 1, 4093);
+  aqThreshPoor      = constrain(base + base * aqPctPoor / 100, aqThreshModerate + 1, 4094);
+  aqThreshHazardous = constrain(base + base * aqPctHazardous / 100, aqThreshPoor + 1, 4095);
+}
+
 // The bands only mean anything if they stay ordered - a UI or serial edit that
 // crosses two of them over would make airQualityLabel() skip a band entirely.
 void sanitizeAqThresholds() {
-  aqThreshModerate  = constrain(aqThreshModerate, 1, 4093);
-  aqThreshPoor      = constrain(aqThreshPoor, aqThreshModerate + 1, 4094);
-  aqThreshHazardous = constrain(aqThreshHazardous, aqThreshPoor + 1, 4095);
+  aqPctModerate  = constrain(aqPctModerate, 5, 300);
+  aqPctPoor      = constrain(aqPctPoor, aqPctModerate + 5, 400);
+  aqPctHazardous = constrain(aqPctHazardous, aqPctPoor + 5, 500);
+  aqApplyLevels();
+}
+
+// Re-learns the clean-air baseline from the 24h ring: the AQ_BASE_PERCENTILE-th
+// lowest 5-minute average. A percentile rather than the minimum so one odd
+// bucket can't drag it down. Once a minute; 288 values is microseconds.
+void aqUpdateBaseline() {
+  int16_t v[AQ_DAY_SLOTS];
+  int n = 0;
+  if (aqDayHasData) {
+    for (int i = 0; i < AQ_DAY_SLOTS; i++) if (aqDayAvg[i] >= 0) v[n++] = aqDayAvg[i];
+  }
+  if (n > 0) {
+    int k = n * AQ_BASE_PERCENTILE / 100;
+    std::nth_element(v, v + k, v + n);
+    aqBaseline = v[k];
+  }
+  aqBaseTrusted = n >= AQ_BASE_MIN_BUCKETS;
+  aqApplyLevels();
 }
 
 // Where the reading sits across the whole Good..Hazardous span, so the number
@@ -562,25 +694,56 @@ uint8_t airQualityPercent(int raw) {
   return (uint8_t)constrain((long)map(raw, 0, top, 0, 100), 0L, 100L);
 }
 
+void sendAqAlert(const char* what, int level, const char* priority) {
+  int pct = aqBaseline > 0 ? (level - aqBaseline) * 100 / aqBaseline : 0;
+  String msg = String("Air quality ") + what + ": " + pct + "% above this room's clean-air level (reading " +
+    level + ", baseline " + aqBaseline + "). Consider ventilating.";
+  sendNtfyNotification("Air Quality Alert", msg, priority, "warning");
+}
+
+// Episode state machine - see the AQ_ALERT_* constants for the rules. Runs on
+// every warm sample (2s) and decides on aqSmooth, never on a single reading.
 void checkAirQualityAlert(int raw) {
   if (!mq135Ready) return;
-
-  bool isPoor = raw >= aqThreshPoor;
   unsigned long now = millis();
+  // ~1 minute EMA at one sample per aqInterval. Seeded with the first warm read.
+  aqSmooth = aqSmooth <= 0 ? raw : aqSmooth + (raw - aqSmooth) * (aqInterval / 60000.0f);
+  if (!aqBaseTrusted) return; // still learning what "clean" means in this room
 
-  if (isPoor) {
-    if (!aqAlertActive || (now - lastAqAlertSent >= AQ_ALERT_REPEAT_MS)) {
-      bool hazardous = raw >= aqThreshHazardous;
-      String label = hazardous ? "HAZARDOUS" : "POOR";
-      String msg = "Air quality is " + label + " (raw " + String(raw) + ", alert level " +
-        String(hazardous ? aqThreshHazardous : aqThreshPoor) + "). Consider ventilating the room.";
-      sendNtfyNotification("Air Quality Alert", msg, hazardous ? "urgent" : "high", "warning");
-      aqAlertActive = true;
-      lastAqAlertSent = now;
-    }
-  } else if (aqAlertActive && raw < aqThreshModerate) {
-    sendNtfyNotification("Air Quality Normal", "Air quality has returned to normal levels.", "default", "white_check_mark");
+  int s = (int)aqSmooth;
+  aqPoorSince = s >= aqThreshPoor ? (aqPoorSince ? aqPoorSince : now) : 0;
+  bool poorHeld = aqPoorSince && now - aqPoorSince >= AQ_ALERT_HOLD_MS;
+
+  if (!aqAlertActive) {
+    if (!poorHeld) return;
+    if (lastAqEpisodeEnd && now - lastAqEpisodeEnd < AQ_ALERT_COOLDOWN_MS) return;
+    bool haz = s >= aqThreshHazardous;
+    aqAlertActive = true;
+    aqEpisodeHazSent = haz;
+    aqHazSince = aqClearSince = 0;
+    lastAqAlertSent = now;
+    sendAqAlert(haz ? "HAZARDOUS" : "POOR", s, haz ? "urgent" : "high");
+    return;
+  }
+
+  // Inside an episode: one escalation, then sparse reminders.
+  aqHazSince = s >= aqThreshHazardous ? (aqHazSince ? aqHazSince : now) : 0;
+  if (!aqEpisodeHazSent && aqHazSince && now - aqHazSince >= AQ_ALERT_HOLD_MS) {
+    aqEpisodeHazSent = true;
+    lastAqAlertSent = now;
+    sendAqAlert("now HAZARDOUS", s, "urgent");
+  } else if (poorHeld && now - lastAqAlertSent >= AQ_ALERT_REMIND_MS) {
+    lastAqAlertSent = now;
+    sendAqAlert("still POOR", s, "default");
+  }
+
+  aqClearSince = s < aqThreshModerate ? (aqClearSince ? aqClearSince : now) : 0;
+  if (aqClearSince && now - aqClearSince >= AQ_CLEAR_HOLD_MS) {
     aqAlertActive = false;
+    aqPoorSince = 0;
+    lastAqEpisodeEnd = now;
+    // "low" = listed in the app without a sound; the all-clear isn't urgent.
+    sendNtfyNotification("Air Quality Normal", "Air quality is back to this room's normal level.", "low", "white_check_mark");
   }
 }
 
@@ -704,6 +867,9 @@ void aqDayResume() {
   aqBucketSum = 0; aqBucketN = 0; aqBucketPeak = 0;
   Serial.printf("[AQ] restored 24h history (%lu min gap while off)\n",
     (unsigned long)(off * AQ_DAY_BUCKET_S / 60));
+  // Learn the baseline from it now rather than at the first post-warm-up
+  // minute tick, so the bar and graph have real levels from a few seconds in.
+  aqUpdateBaseline();
 }
 
 void sendUdpPkt(IPAddress ip, bool on, CRGB color, uint8_t bri) {
@@ -769,10 +935,11 @@ void resolveStrip(int strip, bool& outOn, CRGB& outColor, uint8_t& outBri) {
   }
 }
 
-// Pushes each strip its own state. `force` skips the per-strip dedupe and adds
-// the slow HTTP fallback; the periodic 3s tick and config changes use it, while
-// the 20Hz music path leans on the dedupe to stay cheap.
-void syncStrips(bool force) {
+// Pushes each strip its own state. `force` skips the per-strip dedupe (the 20Hz
+// music path, config changes, the periodic tick); `includeHttp` adds the slow
+// HTTP fallback and is only for the periodic 3s tick. Those used to be one flag,
+// so the music path also opened two TCP connections to the slaves every 50ms.
+void syncStrips(bool force, bool includeHttp) {
   // 1. UDP unicast per configured slave (reliable). This is the only path that
   // can address a single strip, so all per-strip state rides on it.
   for (int i = 0; i < NUM_SLAVES; i++) {
@@ -795,7 +962,13 @@ void syncStrips(bool force) {
   // here and immediately undo its unicast. Only broadcast while every strip is
   // enabled and showing exactly the same thing; discovery resumes once that
   // holds again.
-  if (stripsUniform()) {
+  // Rate-limited because this runs from every loop() via updateLEDs(): the
+  // broadcast used to go out ~20 times a second, each one relayed by the AP to
+  // every station at its slowest rate and acked by every slave, for a path that
+  // only exists to find slaves missing from slaveIPs[].
+  static unsigned long lastBroadcast = 0;
+  if (stripsUniform() && millis() - lastBroadcast >= slaveSyncInterval) {
+    lastBroadcast = millis();
     bool on; CRGB color; uint8_t bri;
     resolveStrip(0, on, color, bri);
     IPAddress bcast = WiFi.broadcastIP();
@@ -803,7 +976,7 @@ void syncStrips(bool force) {
   }
 
   // HTTP — slow fallback, only for the periodic sync
-  if (!force) return;
+  if (!includeHttp) return;
 
   // connect() to a dead host blocks for its full timeout, so offline slaves
   // are only retried every 30s instead of every 3s sync tick.
@@ -993,13 +1166,13 @@ input[type=range]::-moz-range-thumb{width:24px;height:24px;border-radius:50%;bac
 </div>
 </div>
 <div class="ctrl">
-<label>Air quality alert levels (raw sensor value)</label>
+<label>Air quality alert levels (% above this room's clean air)</label>
 <div class="aq-thr">
-<div><small class="aq-moderate">Moderate</small><input type="number" id="aqmIn" min="1" max="4093" onchange="setAqThr()"></div>
-<div><small class="aq-poor">Poor</small><input type="number" id="aqpIn" min="2" max="4094" onchange="setAqThr()"></div>
-<div><small class="aq-hazardous">Hazardous</small><input type="number" id="aqhIn" min="3" max="4095" onchange="setAqThr()"></div>
+<div><small class="aq-moderate">Moderate</small><input type="number" id="aqmIn" min="5" max="300" onchange="setAqThr()"></div>
+<div><small class="aq-poor">Poor</small><input type="number" id="aqpIn" min="10" max="400" onchange="setAqThr()"></div>
+<div><small class="aq-hazardous">Hazardous</small><input type="number" id="aqhIn" min="15" max="500" onchange="setAqThr()"></div>
 </div>
-<div class="aq-hint">The notification fires at <b>Poor</b> and repeats every 30 min. Raise these if you get alerts on air that feels fine &mdash; the sensor's baseline drifts, so compare against the live raw value above.</div>
+<div class="aq-hint">"Clean air" is learned from the last 24 h (the cleanest 10% of readings), so the sensor's day-to-day drift no longer needs retuning. You get one notification once <b>Poor</b> has lasted 5 min, one more if it turns <b>Hazardous</b>, a reminder every 3 h if it stays bad, and a silent all-clear. Getting alerts on air that feels fine? Raise <b>Poor</b>.</div>
 </div>
 </div>
 <script>
@@ -1022,7 +1195,7 @@ function setBright(v){document.getElementById('bVal').textContent=v;clearTimeout
 function setTout(v){fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({timeout:v})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
 function setToff(v){fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({toff:v})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
 function setFx(n){fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({musicFx:n})}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
-function setAqThr(){const b={aqm:+document.getElementById('aqmIn').value,aqp:+document.getElementById('aqpIn').value,aqh:+document.getElementById('aqhIn').value}
+function setAqThr(){const b={aqmPct:+document.getElementById('aqmIn').value,aqpPct:+document.getElementById('aqpIn').value,aqhPct:+document.getElementById('aqhIn').value}
 fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(r=>r.json()).then(d=>{if(d.success)getStatus()})}
 
 // The bar spans 0..top, where top leaves one "poor"-width of headroom above the
@@ -1041,6 +1214,7 @@ aq.textContent=d.aqReady?d.aqLabel:'Warming up'
 aq.className=d.aqReady?('aq-'+d.aqLabel.toLowerCase()):''
 let left='raw <b>'+d.aq+'</b>'
 if(typeof d.aqV!=='undefined')left+=' &middot; '+d.aqV.toFixed(2)+'V'
+if(typeof d.aqBase!=='undefined')left+=' &middot; '+(d.aqBaseOk?'clean air <b>'+d.aqBase+'</b>':'learning clean air')
 document.getElementById('aqMetaL').innerHTML=left
 let right=''
 if(!d.aqReady){right='warm-up '+d.aqWarm+'s'}
@@ -1049,9 +1223,9 @@ else if(d.aqTrend>2){right='&uarr; worsening +'+d.aqTrend+' / '+d.aqTrendMin+' m
 else if(d.aqTrend<-2){right='&darr; clearing '+d.aqTrend+' / '+d.aqTrendMin+' min'}
 else{right='steady over '+d.aqTrendMin+' min'}
 document.getElementById('aqMetaR').innerHTML=right
-if(document.activeElement!==document.getElementById('aqmIn'))document.getElementById('aqmIn').value=d.aqm
-if(document.activeElement!==document.getElementById('aqpIn'))document.getElementById('aqpIn').value=d.aqp
-if(document.activeElement!==document.getElementById('aqhIn'))document.getElementById('aqhIn').value=d.aqh
+if(document.activeElement!==document.getElementById('aqmIn'))document.getElementById('aqmIn').value=d.aqmPct
+if(document.activeElement!==document.getElementById('aqpIn'))document.getElementById('aqpIn').value=d.aqpPct
+if(document.activeElement!==document.getElementById('aqhIn'))document.getElementById('aqhIn').value=d.aqhPct
 }
 
 // --- 24h air quality graph ---
@@ -1220,12 +1394,17 @@ setInterval(getStatus,2000)
 </html>
 )=====";
 
+// Must be send_P. The plain send(code, type, const char*) overload copies the
+// whole ~25KB page into one heap String first; once the heap is fragmented
+// enough that no 25KB block exists, the copy silently comes back empty and the
+// browser gets "200 OK, Content-Length: 0" - a white page - until a reboot.
+// send_P streams straight from flash and needs no heap at all.
 void handleRoot() {
-  server.send(200, "text/html", MAIN_page);
+  server.send_P(200, "text/html", MAIN_page);
 }
 
 void handleStatus() {
-  StaticJsonDocument<1536> doc;
+  StaticJsonDocument<2048> doc;
 
   bool ledOn = getLedOn();
   doc["ledOn"] = ledOn;
@@ -1248,9 +1427,16 @@ void handleStatus() {
   doc["aqLabel"] = airQualityLabel(mq135Raw);
   doc["aqReady"] = mq135Ready;
   doc["aqWarm"] = mq135Ready ? 0 : (MQ135_WARMUP_MS - (millis() - mq135WarmupStart)) / 1000;
-  doc["aqm"] = aqThreshModerate;
+  doc["aqm"] = aqThreshModerate; // effective raw levels, what the bar and graph draw
   doc["aqp"] = aqThreshPoor;
   doc["aqh"] = aqThreshHazardous;
+  doc["aqmPct"] = aqPctModerate; // the settings: % above the learned baseline
+  doc["aqpPct"] = aqPctPoor;
+  doc["aqhPct"] = aqPctHazardous;
+  doc["aqBase"] = aqBaseline;
+  doc["aqBaseOk"] = aqBaseTrusted;
+  doc["aqSmooth"] = (int)aqSmooth;
+  doc["aqAlert"] = aqAlertActive;
   // Trend vs the oldest sample we have; aqTrendMin says how far back that is, so
   // the UI can say "over 4 min" instead of implying a full 10 minutes of history.
   if (aqHistCount > 1) {
@@ -1259,6 +1445,25 @@ void handleStatus() {
     doc["aqTrendMin"] = aqHistCount - 1;
   }
   doc["rssi"] = WiFi.RSSI(); // weak signal here shows up as flaky OTA long before anything else breaks
+  // Uptime, heap and Wi-Fi drop history, readable without a serial cable (see
+  // node_health.h). heap should hover flat over hours; a steady fall is a leak.
+  doc["up"] = millis() / 1000;
+  nodeHealthReport(doc);
+  // Local clock, so the timezone behind the daily AUTO reset can be checked
+  // from outside. Absent until NTP has answered.
+  time_t nowT = time(nullptr);
+  if (nowT > 1700000000) {
+    struct tm lt;
+    localtime_r(&nowT, &lt);
+    char hhmm[6];
+    snprintf(hhmm, sizeof(hhmm), "%02d:%02d", lt.tm_hour, lt.tm_min);
+    doc["time"] = hhmm;
+  }
+  doc["autoAt"] = AUTO_MODE_HOUR;
+  doc["wifiCh"] = WiFi.channel();
+  doc["wifiPs"] = wifiSleepOn;
+  doc["wifiProto"] = wifiProtoName(wifiProto);
+  doc["wifiTxp"] = (int)WiFi.getTxPower(); // quarter-dBm: 78 = 19.5dBm (max)
 
   // Top-level color/brightness mirror strip 0 - kept so anything written
   // against the pre-per-strip API still reads something sensible.
@@ -1306,6 +1511,7 @@ void handleAqHistory() {
   out += ",\"aqm\":";   out += aqThreshModerate;
   out += ",\"aqp\":";   out += aqThreshPoor;
   out += ",\"aqh\":";   out += aqThreshHazardous;
+  out += ",\"aqBase\":"; out += aqBaseline;
 
   if (!aqDayHasData) {
     out += ",\"t0\":"; out += nowS;
@@ -1403,16 +1609,17 @@ void handleSetSettings() {
     musicFx = constrain((int)doc["musicFx"], 0, 2);
   }
   bool aqChanged = false;
-  if (doc.containsKey("aqm")) { aqThreshModerate = doc["aqm"]; aqChanged = true; }
-  if (doc.containsKey("aqp")) { aqThreshPoor = doc["aqp"]; aqChanged = true; }
-  if (doc.containsKey("aqh")) { aqThreshHazardous = doc["aqh"]; aqChanged = true; }
+  // Percent above the learned baseline. A standing episode isn't cut short
+  // here: if the new levels put the air below Moderate it ends through the
+  // normal 10-minute clear, so edits can't produce an alert/all-clear burst.
+  if (doc.containsKey("aqmPct")) { aqPctModerate = doc["aqmPct"]; aqChanged = true; }
+  if (doc.containsKey("aqpPct")) { aqPctPoor = doc["aqpPct"]; aqChanged = true; }
+  if (doc.containsKey("aqhPct")) { aqPctHazardous = doc["aqhPct"]; aqChanged = true; }
   if (aqChanged) {
     sanitizeAqThresholds();
-    // Raising the bar past the current reading should clear a standing alert
-    // rather than leave it latched until the air happens to improve.
-    if (aqAlertActive && mq135Raw < aqThreshModerate) aqAlertActive = false;
-    Serial.printf("[MQ135] thresholds now moderate>=%d poor>=%d hazardous>=%d (raw=%d)\n",
-      aqThreshModerate, aqThreshPoor, aqThreshHazardous, mq135Raw);
+    Serial.printf("[MQ135] levels now +%d/+%d/+%d%% over baseline %d = %d/%d/%d raw\n",
+      aqPctModerate, aqPctPoor, aqPctHazardous, aqBaseline,
+      aqThreshModerate, aqThreshPoor, aqThreshHazardous);
   }
   markSettingsDirty();
 
@@ -1440,12 +1647,45 @@ void handleSetStrips() {
   server.send(200, "application/json", "{\"success\":true}");
 }
 
+// POST /api/wifi - diagnostic link knobs, for A/B testing a bad link without a
+// reflash per guess. Deliberately not saved: any reboot, including a
+// node_health self-heal, puts the defaults back, so a setting that loses the
+// link can't strand the node. {"sleep":bool, "txp":8..78, "proto":"b|bg|bgn"}
+void handleSetWifi() {
+  if (!server.hasArg("plain")) { server.send(400, "application/json", "{\"success\":false}"); return; }
+
+  StaticJsonDocument<128> doc;
+  if (deserializeJson(doc, server.arg("plain"))) { server.send(400, "application/json", "{\"success\":false}"); return; }
+
+  if (doc.containsKey("sleep")) {
+    wifiSleepOn = doc["sleep"];
+    WiFi.setSleep(wifiSleepOn);
+  }
+  if (doc.containsKey("txp")) {
+    WiFi.setTxPower((wifi_power_t)constrain((int)doc["txp"], 8, 78));
+  }
+  if (doc.containsKey("proto")) {
+    const char* p = doc["proto"] | "bgn";
+    uint8_t v = !strcmp(p, "b")  ? WIFI_PROTOCOL_11B :
+                !strcmp(p, "bg") ? (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G) :
+                                   (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+    if (v != wifiProto) {
+      wifiProto = v;
+      esp_wifi_set_protocol(WIFI_IF_STA, v);
+      // The AP only picks rates from what we offered at association, so this
+      // needs a rejoin - from loop(), once this response has gone out.
+      wifiRejoinAt = millis() + 500;
+    }
+  }
+  Serial.printf("[WiFi] knobs: sleep=%d txp=%d proto=%s\n", wifiSleepOn, (int)WiFi.getTxPower(), wifiProtoName(wifiProto));
+  server.send(200, "application/json", "{\"success\":true}");
+}
+
 void handleNotFound() {
   String msg = "File Not Found\nURI: " + server.uri();
   server.send(404, "text/plain", msg);
 }
 
-unsigned long lastWiFiAttempt = 0;
 unsigned long lastSerialPrint = 0;
 const unsigned long serialPrintInterval = 2000;
 volatile bool otaActive = false; // set in ArduinoOTA.onStart, see loop()
@@ -1458,6 +1698,7 @@ void setupServer() {
   server.on("/api/led", HTTP_POST, handleSetLed);
   server.on("/api/settings", HTTP_POST, handleSetSettings);
   server.on("/api/strips", HTTP_POST, handleSetStrips);
+  server.on("/api/wifi", HTTP_POST, handleSetWifi);
   server.onNotFound(handleNotFound);
   server.begin();
   Serial.println("Server started");
@@ -1486,10 +1727,11 @@ void startWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print("Connected, IP: ");
     Serial.println(WiFi.localIP());
-    // UTC, no timezone offset: the browser formats the 24h graph's x-axis in
-    // its own zone, so the node never has to know about DST. This is also what
-    // makes the history survive a reboot - see aqDayResume().
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    // TZ only changes localtime() (used by checkDailyAuto); time() stays UTC
+    // epoch, which is what the 24h graph sends - the browser formats its x-axis
+    // in its own zone. A synced clock is also what makes the history survive a
+    // reboot - see aqDayResume().
+    configTzTime(LOCAL_TZ, "pool.ntp.org", "time.nist.gov");
   } else {
     Serial.println("WiFi failed, will retry in loop");
   }
@@ -1519,7 +1761,7 @@ void processSerialCommands() {
         Serial.println("  status     - Show all status");
         Serial.println("  mic        - Read MAX9814 mic level");
         Serial.println("  aq         - Read MQ135 air quality sensor");
-        Serial.println("  aqset a b c- Set moderate/poor/hazardous thresholds");
+        Serial.println("  aqset a b c- Set moderate/poor/hazardous, % above the learned baseline");
         Serial.println("  aqday      - Summarize the 24h history behind the web graph");
         Serial.println("  testnotify - Send a test ntfy.sh notification");
         Serial.println("=================================\n");
@@ -1576,6 +1818,8 @@ void processSerialCommands() {
           soundLevel, soundPeakToPeak, bassEnv, trebEnv, envMax);
         Serial.printf("Air quality: raw=%d volt=%.2fV [%s] %s\n", mq135Raw, mq135Voltage,
           airQualityLabel(mq135Raw), mq135Ready ? "" : "(warming up)");
+        Serial.printf("Uptime %lus | heap free=%u min=%u largest block=%u\n", millis() / 1000,
+          ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap());
       } else if (cmdBuffer == "mic") {
         Serial.printf("Mic level: %d/255  peak-to-peak=%d  auto-gain ceiling=%.0f\n", soundLevel, soundPeakToPeak, envMax);
         Serial.printf("Envelopes: bass=%.2f treble=%.2f total=%.2f | beatPulse=%.2f lastBeat=%lums ago\n",
@@ -1588,26 +1832,28 @@ void processSerialCommands() {
         if (!mq135Ready) {
           Serial.printf("Still warming up (%lu s remaining)\n", (MQ135_WARMUP_MS - (millis() - mq135WarmupStart)) / 1000);
         }
-        Serial.printf("Thresholds (raw): moderate>=%d poor>=%d hazardous>=%d  [alert fires at %d]\n",
-          aqThreshModerate, aqThreshPoor, aqThreshHazardous, aqThreshPoor);
+        Serial.printf("Baseline %d (%s), smoothed %d | levels +%d/+%d/+%d%% = moderate>=%d poor>=%d hazardous>=%d\n",
+          aqBaseline, aqBaseTrusted ? "learned" : "still learning, alerts off", (int)aqSmooth,
+          aqPctModerate, aqPctPoor, aqPctHazardous, aqThreshModerate, aqThreshPoor, aqThreshHazardous);
+        Serial.printf("Alert episode: %s\n", aqAlertActive ? "active" : "none");
         if (aqHistCount > 1) {
           int oldest = aqHist[aqHistCount < AQ_HIST_SLOTS ? 0 : aqHistIdx];
           Serial.printf("Trend: %+d over the last %d min\n", mq135Raw - oldest, aqHistCount - 1);
         } else {
           Serial.println("Trend: collecting (one sample per minute)");
         }
-        Serial.println("Change them with: aqset <moderate> <poor> <hazardous>");
+        Serial.println("Change them with: aqset <moderate%> <poor%> <hazardous%>");
       } else if (cmdBuffer.startsWith("aqset")) {
         int m1, p1, h1;
         if (sscanf(cmdBuffer.c_str(), "aqset %d %d %d", &m1, &p1, &h1) == 3) {
-          aqThreshModerate = m1; aqThreshPoor = p1; aqThreshHazardous = h1;
+          aqPctModerate = m1; aqPctPoor = p1; aqPctHazardous = h1;
           sanitizeAqThresholds();
-          if (aqAlertActive && mq135Raw < aqThreshModerate) aqAlertActive = false;
           markSettingsDirty();
-          Serial.printf("Thresholds set: moderate>=%d poor>=%d hazardous>=%d (raw now %d -> %s)\n",
+          Serial.printf("Levels set: +%d/+%d/+%d%% over baseline %d = %d/%d/%d raw (now %d -> %s)\n",
+            aqPctModerate, aqPctPoor, aqPctHazardous, aqBaseline,
             aqThreshModerate, aqThreshPoor, aqThreshHazardous, mq135Raw, airQualityLabel(mq135Raw));
         } else {
-          Serial.println("Usage: aqset <moderate> <poor> <hazardous>   e.g. aqset 130 155 195");
+          Serial.println("Usage: aqset <moderate%> <poor%> <hazardous%>   e.g. aqset 30 60 100");
         }
       } else if (cmdBuffer == "aqday") {
         int filled = 0, mn = 4095, mx = 0;
@@ -1689,6 +1935,7 @@ void setup() {
     // starves the OTA socket and aborts the transfer partway. Park the strip
     // and let loop() spin on handle() alone until the update finishes.
     otaActive = true;
+    nodeHealthOtaStart();
     FastLED.clear();
     FastLED.show();
     // Last chance to keep the 24h history across the reboot this update ends
@@ -1699,28 +1946,23 @@ void setup() {
   ArduinoOTA.onEnd([]() { Serial.println("OTA: done"); });
   ArduinoOTA.onError([](ota_error_t e) {
     otaActive = false; // failed update: fall back to normal loop duties
+    nodeHealthOtaError();
     Serial.printf("OTA: error %d\n", e);
   });
   ArduinoOTA.begin();
   Serial.println("OTA ready");
+
+  nodeHealthBegin();
 }
 
 void loop() {
   ArduinoOTA.handle();
   if (otaActive) return; // nothing else until the update lands (or errors out)
 
-  if (WiFi.status() == WL_CONNECTED) {
+  // Reconnect, and the reboot if it never comes back, live in node_health.h.
+  // aqDaySave so a self-heal reboot doesn't cost up to 30 min of graph.
+  if (nodeHealthLoop(ssid, password, aqDaySave)) {
     server.handleClient();
-  } else {
-    unsigned long n = millis();
-    if (n - lastWiFiAttempt > 10000) {
-      lastWiFiAttempt = n;
-      Serial.println("Reconnecting WiFi...");
-      WiFi.mode(WIFI_OFF);
-      delay(100);
-      WiFi.mode(WIFI_STA);
-      WiFi.begin(ssid, password);
-    }
   }
 
   readMotionSensor();
@@ -1738,13 +1980,14 @@ void loop() {
   // sync then so it doesn't fight with that and briefly flash stale color.
   if (ledMode != SOUND && millis() - lastSlaveSync >= slaveSyncInterval) {
     lastSlaveSync = millis();
-    syncStrips(true);
+    syncStrips(true, true);
   }
 
   processSerialCommands();
 
   sampleMic();
   processSlaveAcks();
+  checkDailyAuto();
   persistSettings();
 
   unsigned long m = millis();
@@ -1786,6 +2029,12 @@ void loop() {
     aqHist[aqHistIdx] = mq135Raw;
     aqHistIdx = (aqHistIdx + 1) % AQ_HIST_SLOTS;
     if (aqHistCount < AQ_HIST_SLOTS) aqHistCount++;
+    aqUpdateBaseline(); // same once-a-minute cadence; the 24h ring it reads moves slower still
+  }
+
+  if (wifiRejoinAt && (long)(millis() - wifiRejoinAt) >= 0) {
+    wifiRejoinAt = 0;
+    WiFi.reconnect(); // shows up once in wifiDrops - that one is self-inflicted
   }
 
   updateLEDs();
